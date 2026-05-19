@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Holo Vault — Card Manager</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: #1a1a2e;
+      border-bottom: 2px solid #e63946;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    header h1 { font-size: 1.3rem; color: #fff; letter-spacing: 1px; }
+    header h1 span { color: #e63946; }
+
+    .sync-btn {
+      background: #e63946;
+      color: #fff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    .sync-btn:hover { background: #c1121f; }
+    .sync-btn:disabled { background: #555; cursor: not-allowed; }
+
+    /* ── Split Layout ── */
+    .split {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      flex: 1;
+      overflow: hidden;
+      height: calc(100vh - 53px);
+    }
+
+    /* ── LEFT PANEL — Managed Products ── */
+    .left-panel {
+      background: #111;
+      border-right: 1px solid #222;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .left-panel-header {
+      padding: 16px;
+      border-bottom: 1px solid #222;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .left-panel-header h2 { font-size: 0.95rem; color: #fff; }
+
+    .left-panel-header span {
+      background: #1d3557;
+      color: #60a5fa;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+
+    #products-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .product-card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 12px;
+      transition: border-color 0.2s;
+    }
+    .product-card:hover { border-color: #444; }
+
+    .product-card .p-title {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 8px;
+      line-height: 1.3;
+    }
+
+    .product-card .p-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .product-card .p-delete-btn {
+      margin-left: auto;
+      background: transparent;
+      color: #f87171;
+      border: 1px solid #f87171;
+      border-radius: 5px;
+      padding: 3px 8px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      transition: background 0.2s, color 0.2s;
+    }
+    .product-card .p-delete-btn:hover { background: #f87171; color: #fff; }
+
+    .product-card .p-mult-label { font-size: 0.75rem; color: #888; }
+
+    .product-card .p-mult-input {
+      width: 60px;
+      background: #0f0f0f;
+      border: 1px solid #333;
+      border-radius: 5px;
+      padding: 3px 6px;
+      color: #e0e0e0;
+      font-size: 0.8rem;
+    }
+
+    .product-card .p-save-btn {
+      background: #1d3557;
+      color: #fff;
+      border: 1px solid #457b9d;
+      border-radius: 5px;
+      padding: 3px 8px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      transition: background 0.2s;
+    }
+    .product-card .p-save-btn:hover { background: #457b9d; }
+
+    /* ── RIGHT PANEL — Search ── */
+    .right-panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .search-bar {
+      padding: 16px;
+      border-bottom: 1px solid #222;
+      background: #111;
+      flex-shrink: 0;
+    }
+
+    .search-bar h2 { font-size: 0.95rem; color: #fff; margin-bottom: 10px; }
+
+    .search-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .search-row input {
+      flex: 1;
+      background: #0f0f0f;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 9px 14px;
+      color: #e0e0e0;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .search-row input:focus { border-color: #e63946; }
+
+    .search-row button {
+      background: #e63946;
+      color: #fff;
+      border: none;
+      padding: 9px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 600;
+      white-space: nowrap;
+      transition: background 0.2s;
+    }
+    .search-row button:hover { background: #c1121f; }
+    .search-row button:disabled { background: #555; cursor: not-allowed; }
+
+    #search-results {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 14px;
+      align-content: start;
+    }
+
+    .card-item {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      overflow: hidden;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .card-item:hover { border-color: #e63946; transform: translateY(-2px); }
+
+    .card-item img {
+      width: 100%;
+      aspect-ratio: 3/4;
+      object-fit: cover;
+      background: #111;
+    }
+
+    .card-info { padding: 8px; }
+    .card-name { font-size: 0.8rem; font-weight: 600; color: #fff; margin-bottom: 3px; line-height: 1.3; }
+    .card-set { font-size: 0.7rem; color: #888; margin-bottom: 5px; }
+    .card-price { font-size: 0.95rem; font-weight: 700; color: #4ade80; }
+    .card-change { font-size: 0.7rem; margin-top: 2px; }
+    .card-change.up { color: #4ade80; }
+    .card-change.down { color: #f87171; }
+
+    .add-row { display: flex; align-items: center; gap: 4px; margin-top: 6px; }
+    .add-row label { font-size: 0.7rem; color: #888; }
+    .add-row input[type="number"] {
+      width: 60px;
+      background: #0f0f0f;
+      border: 1px solid #333;
+      border-radius: 5px;
+      padding: 4px 6px;
+      color: #e0e0e0;
+      font-size: 0.75rem;
+    }
+
+    .add-card-btn {
+      width: 100%;
+      margin-top: 5px;
+      background: #1d3557;
+      color: #fff;
+      border: 1px solid #457b9d;
+      border-radius: 6px;
+      padding: 5px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    .add-card-btn:hover { background: #457b9d; }
+    .add-card-btn:disabled { background: #333; border-color: #444; cursor: not-allowed; }
+    .add-card-btn.added { background: #166534; border-color: #4ade80; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: #1a1a2e;
+      border: 1px solid #457b9d;
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      opacity: 0;
+      transition: opacity 0.3s;
+      z-index: 999;
+      max-width: 300px;
+    }
+    #toast.show { opacity: 1; }
+    #toast.error { border-color: #e63946; }
+    #toast.success { border-color: #4ade80; }
+
+    .empty-state { color: #555; text-align: center; padding: 32px; font-size: 0.85rem; grid-column: 1/-1; }
+    .loading { color: #888; text-align: center; padding: 20px; grid-column: 1/-1; }
+
+    /* Scrollbar styling */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #111; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #555; }
+
+    @media (max-width: 768px) {
+      .split { grid-template-columns: 1fr; height: auto; overflow: visible; }
+      .left-panel { height: 300px; border-right: none; border-bottom: 1px solid #222; }
+      #search-results { height: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Holo Vault <span>Card Manager</span></h1>
+  <button class="sync-btn" id="sync-btn" onclick="triggerSync()">⟳ Sync Prices Now</button>
+</header>
+
+<div class="split">
+
+  <!-- LEFT — Managed Products -->
+  <div class="left-panel">
+    <div class="left-panel-header">
+      <h2>Managed Products</h2>
+      <span id="product-count">0</span>
+    </div>
+    <div id="products-list"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- RIGHT — Search & Add -->
+  <div class="right-panel">
+    <div class="search-bar">
+      <h2>Search &amp; Add Card from Collectr</h2>
+      <div class="search-row">
+        <input
+          type="text"
+          id="search-input"
+          placeholder="Search card name (e.g. Charizard, Pikachu ex...)"
+          onkeydown="if(event.key==='Enter') doSearch()"
+        />
+        <button id="search-btn" onclick="doSearch()">Search</button>
+      </div>
+    </div>
+    <div id="search-results"><div class="empty-state">Search for a card to get started.</div></div>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+  let searchResults = [];
+
+  // ── Search ─────────────────────────────────────────────────────────────────
+  async function doSearch() {
+    const q = document.getElementById('search-input').value.trim();
+    if (q.length < 2) return showToast('Enter at least 2 characters.', 'error');
+
+    const btn = document.getElementById('search-btn');
+    btn.disabled = true;
+    btn.textContent = 'Searching...';
+    document.getElementById('search-results').innerHTML = '<div class="loading">Fetching from Collectr...</div>';
+
+    try {
+      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Search failed');
+      searchResults = data.cards || [];
+      renderSearchResults(searchResults);
+    } catch (err) {
+      document.getElementById('search-results').innerHTML = '<div class="empty-state">Search failed. Try again.</div>';
+      showToast(err.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Search';
+    }
+  }
+
+  function renderSearchResults(cards) {
+    const container = document.getElementById('search-results');
+    if (cards.length === 0) {
+      container.innerHTML = '<div class="empty-state">No cards found.</div>';
+      return;
+    }
+    container.innerHTML = cards.map((card, i) => {
+      const changeClass = card.priceChangePct >= 0 ? 'up' : 'down';
+      const changeSign = card.priceChangePct >= 0 ? '+' : '';
+      const imgSrc = card.imageUrl || 'https://placehold.co/160x213?text=No+Image';
+      return `
+        <div class="card-item">
+          <img src="${escHtml(imgSrc)}" alt="${escHtml(card.name)}" loading="lazy" onerror="this.src='https://placehold.co/160x213?text=No+Image'" />
+          <div class="card-info">
+            <div class="card-name">${escHtml(card.name)}</div>
+            <div class="card-set">${escHtml(card.setName || '')}${card.cardNumber ? ' #' + escHtml(card.cardNumber) : ''}</div>
+            <div class="card-price">$${card.price.toFixed(2)}</div>
+            <div class="card-change ${changeClass}">${changeSign}${card.priceChangePct.toFixed(2)}%</div>
+            <div class="add-row">
+              <label>×</label>
+              <input type="number" id="mult-${i}" value="1.00" min="0.01" max="10" step="0.05" />
+            </div>
+            <button class="add-card-btn" id="add-btn-${i}" onclick="addCard(${i})">+ Add to Shopify</button>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  async function addCard(index) {
+    const card = searchResults[index];
+    const multiplier = parseFloat(document.getElementById(`mult-${index}`).value) || 1.0;
+    const btn = document.getElementById(`add-btn-${index}`);
+    btn.disabled = true;
+    btn.textContent = 'Adding...';
+    try {
+      const res = await fetch('/api/add-card', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ card, multiplier }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to add card');
+      btn.textContent = '✓ Added';
+      btn.classList.add('added');
+      showToast(`"${card.name}" added at $${data.product.price}`, 'success');
+      loadProducts();
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = '+ Add to Shopify';
+      showToast(err.message, 'error');
+    }
+  }
+
+  // ── Products List ──────────────────────────────────────────────────────────
+  async function loadProducts() {
+    const container = document.getElementById('products-list');
+    try {
+      const res = await fetch('/api/products');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to load');
+      const products = data.products || [];
+      document.getElementById('product-count').textContent = products.length;
+      if (products.length === 0) {
+        container.innerHTML = '<div class="empty-state">No managed products yet.<br>Add cards from the search panel.</div>';
+        return;
+      }
+      container.innerHTML = products.map((p) => `
+        <div class="product-card" id="pcard-${p.productId}">
+          <div class="p-title">${escHtml(p.title)}</div>
+          <div class="p-meta">
+            <span class="p-mult-label">×</span>
+            <input class="p-mult-input" type="number" id="pmult-${p.productId}" value="${p.multiplier}" min="0.01" max="10" step="0.05" />
+            <button class="p-save-btn" onclick="saveMultiplier('${p.productId}')">Save</button>
+            <button class="p-delete-btn" onclick="deleteProduct('${p.productId}', '${escHtml(p.title)}')">✕ Delete</button>
+          </div>
+        </div>`).join('');
+    } catch (err) {
+      container.innerHTML = `<div class="empty-state">Error: ${escHtml(err.message)}</div>`;
+    }
+  }
+
+  async function deleteProduct(productId, title) {
+    if (!confirm(`Delete "${title}" from Shopify? This cannot be undone.`)) return;
+    try {
+      const res = await fetch(`/api/products/${productId}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to delete');
+      document.getElementById(`pcard-${productId}`)?.remove();
+      const count = document.getElementById('product-count');
+      count.textContent = Math.max(0, parseInt(count.textContent) - 1);
+      showToast(`"${title}" deleted from Shopify.`, 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  async function saveMultiplier(productId) {
+    const input = document.getElementById(`pmult-${productId}`);
+    const multiplier = parseFloat(input.value);
+    if (isNaN(multiplier) || multiplier <= 0) return showToast('Invalid multiplier.', 'error');
+    try {
+      const res = await fetch(`/api/products/${productId}/multiplier`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ multiplier }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed');
+      showToast('Multiplier updated!', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  // ── Sync ───────────────────────────────────────────────────────────────────
+  async function triggerSync() {
+    const btn = document.getElementById('sync-btn');
+    btn.disabled = true;
+    btn.textContent = 'Syncing...';
+    try {
+      const res = await fetch('/api/sync', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Sync failed');
+      showToast('Sync started! Check server logs.', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setTimeout(() => { btn.disabled = false; btn.textContent = '⟳ Sync Prices Now'; }, 3000);
+    }
+  }
+
+  // ── Toast ──────────────────────────────────────────────────────────────────
+  let toastTimer;
+  function showToast(msg, type = 'info') {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.className = `show ${type}`;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.className = ''; }, 4000);
+  }
+
+  function escHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  loadProducts();
+</script>
+</body>
+</html>
