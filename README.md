@@ -4,6 +4,8 @@ Automatically syncs Pokémon card prices from Collectr to your Shopify store.
 
 Deployed on **Railway** from this repo (`justin-brown-hr/holovault`). See `.env.example` for env vars.
 
+**Railway shows "GitHub Repo not found"?** See [RAILWAY.md](./RAILWAY.md) — reconnect repo, clear root directory `app`, redeploy.
+
 ---
 
 ## Setup (One Time)
