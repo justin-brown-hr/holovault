@@ -4,11 +4,6 @@
  *
  * Collectr uses Next.js SSR. The search results are embedded as escaped JSON
  * inside self.__next_f.push([1,"..."]) script tags in the HTML.
- *
- * Confirmed format from curl:
- *   {\"data\":[{\"product_id\":\"684462\",\"catalog_category\":\"3\",...}]
- *
- * Search URL: https://app.getcollectr.com/?query=charizard
  */
 
 const axios = require('axios');
@@ -17,7 +12,7 @@ const COLLECTR_BASE = 'https://app.getcollectr.com';
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
@@ -33,31 +28,89 @@ async function searchCards(query) {
 }
 
 /**
- * Get fresh price for a card by searching its name.
+ * Parse productId (and optional set slug) from a Collectr product URL.
  */
-async function getCardDetails(collectrUrl) {
-  const slug = collectrUrl.split('/').pop() || '';
-  const query = slug.replace(/-/g, ' ');
-  const cards = await searchCards(query);
-  return cards.length > 0 ? cards[0] : null;
+function parseCollectrUrl(collectrUrl) {
+  if (!collectrUrl) return { productId: null, groupSlug: null };
+  const productId = collectrUrl.match(/[?&]productId=([^&]+)/i)?.[1] || null;
+  const slugMatch = collectrUrl.match(/\/([^/?]+)\?productId=/i);
+  const groupSlug = slugMatch ? slugMatch[1] : null;
+  return { productId, groupSlug };
+}
+
+/**
+ * Find one card in search results by Collectr product_id.
+ */
+function findCardById(cards, productId) {
+  if (!productId || !cards?.length) return null;
+  return cards.find((c) => String(c.collectrId) === String(productId)) || null;
+}
+
+/**
+ * Resolve the correct Collectr listing (variant) for sync.
+ * Never returns searchResults[0] unless it matches the stored product id.
+ */
+async function resolveCardForSync({ collectrId, collectrUrl, title, subType }) {
+  const { productId: urlProductId, groupSlug } = parseCollectrUrl(collectrUrl);
+  const targetId = collectrId || urlProductId;
+
+  const queries = [];
+  if (title) queries.push(title);
+  if (groupSlug) queries.push(groupSlug.replace(/-/g, ' '));
+
+  // Strip trailing " — Holofoil" style suffix for broader search
+  const baseTitle = title?.replace(/\s*—\s*[^—]+$/, '').trim();
+  if (baseTitle && baseTitle !== title) queries.push(baseTitle);
+
+  const seen = new Set();
+  for (const q of queries) {
+    if (!q || seen.has(q)) continue;
+    seen.add(q);
+    const cards = await searchCards(q);
+    if (targetId) {
+      const match = findCardById(cards, targetId);
+      if (match) {
+        console.log(`[Collectr] Matched id ${targetId} via query "${q}"`);
+        return match;
+      }
+    }
+    // Single unambiguous result
+    if (cards.length === 1) {
+      console.log(`[Collectr] Single result for "${q}"`);
+      return cards[0];
+    }
+    // Multiple results: match finish/subtype if we have it stored
+    if (subType && cards.length > 1) {
+      const subMatch = cards.find(
+        (c) => c.subType && c.subType.toLowerCase() === subType.toLowerCase()
+      );
+      if (subMatch) {
+        console.log(`[Collectr] Matched subType "${subType}" via query "${q}"`);
+        return subMatch;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * @deprecated Use resolveCardForSync — kept for compatibility.
+ */
+async function getCardDetails(collectrUrl, hintTitle) {
+  const { productId } = parseCollectrUrl(collectrUrl);
+  return resolveCardForSync({
+    collectrId: productId,
+    collectrUrl,
+    title: hintTitle,
+  });
 }
 
 /**
  * Extract cards from the Next.js SSR HTML.
- *
- * The HTML contains script tags like:
- *   self.__next_f.push([1,"...escaped json..."])
- *
- * Inside those, the product array looks like:
- *   {\"data\":[{\"product_id\":\"123\",\"catalog_category\":\"3\",...}]
  */
 function extractCardsFromHtml(html) {
   try {
-    // Confirmed format from curl:
-    // \\"pages\\":[{\\"data\\":[{\\"product_id\\":\\"684462\\",...
-    // We find the marker, grab everything from [ to the matching ]
-    // then unescape \\" → " to get valid JSON
-
     const MARKER = '\\"data\\":[{\\"product_id\\"';
     const markerIdx = html.indexOf(MARKER);
 
@@ -66,25 +119,19 @@ function extractCardsFromHtml(html) {
       return [];
     }
 
-    // The [ is right at the end of \\"data\\":
-    // marker is: \"data\":[{\"product_id\"
-    // so arrayStart = markerIdx + length of \"data\":
     const arrayStart = markerIdx + '\\"data\\":'.length;
 
-    // Walk forward counting [ and ] but treating \" as a string toggle
     let depth = 0;
     let inString = false;
     let i = arrayStart;
 
     while (i < html.length) {
-      // \" = escaped quote → toggle string mode
-      if (html[i] === '\\' && html[i+1] === '"') {
+      if (html[i] === '\\' && html[i + 1] === '"') {
         inString = !inString;
         i += 2;
         continue;
       }
-      // \\ = escaped backslash → skip
-      if (html[i] === '\\' && html[i+1] === '\\') {
+      if (html[i] === '\\' && html[i + 1] === '\\') {
         i += 2;
         continue;
       }
@@ -93,7 +140,10 @@ function extractCardsFromHtml(html) {
         if (html[i] === '[') depth++;
         if (html[i] === ']') {
           depth--;
-          if (depth === 0) { i++; break; }
+          if (depth === 0) {
+            i++;
+            break;
+          }
         }
       }
       i++;
@@ -101,7 +151,6 @@ function extractCardsFromHtml(html) {
 
     const rawEscaped = html.substring(arrayStart, i);
 
-    // Unescape: \" → " (each backslash+quote becomes just a quote)
     const unescaped = rawEscaped
       .replace(/\\"/g, '"')
       .replace(/\\u0026/g, '&')
@@ -117,13 +166,8 @@ function extractCardsFromHtml(html) {
 
     console.log(`[Collectr] Found ${products.length} products`);
     return products.map(normalizeProduct);
-
   } catch (err) {
     console.error('[Collectr] Parse error:', err.message);
-    const debugIdx = html.indexOf('\\"data\\":[{\\"product_id\\"');
-    if (debugIdx !== -1) {
-      console.error('[Collectr] Raw sample:', html.substring(debugIdx, debugIdx + 100));
-    }
     return [];
   }
 }
@@ -136,9 +180,10 @@ function normalizeProduct(item) {
   const priceChange = parseFloat(item.market_price_diff || 0);
   const priceChangePct = parseFloat(item.market_price_percentage_diff || 0);
 
-  const collectrUrl = item.web_slug_group && item.web_slug_category
-    ? `${COLLECTR_BASE}/sets/category/${item.web_slug_category}/${item.web_slug_group}?productId=${item.product_id}`
-    : '';
+  const collectrUrl =
+    item.web_slug_group && item.web_slug_category
+      ? `${COLLECTR_BASE}/sets/category/${item.web_slug_category}/${item.web_slug_group}?productId=${item.product_id}`
+      : '';
 
   return {
     collectrId: item.product_id || null,
@@ -156,8 +201,22 @@ function normalizeProduct(item) {
   };
 }
 
-async function closeBrowser() {
-  // No-op: no browser used
+function formatSubTypeLabel(subType) {
+  if (!subType) return '';
+  return subType
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-module.exports = { searchCards, getCardDetails, closeBrowser };
+async function closeBrowser() {
+  // No-op
+}
+
+module.exports = {
+  searchCards,
+  getCardDetails,
+  resolveCardForSync,
+  parseCollectrUrl,
+  formatSubTypeLabel,
+  closeBrowser,
+};

@@ -7,7 +7,7 @@
  * Or scheduled via server.js cron (runs daily at 6am)
  */
 
-const { searchCards, getCardDetails, closeBrowser } = require('./collectr');
+const { resolveCardForSync, closeBrowser } = require('./collectr');
 const { getManagedProducts, updateProductPrice } = require('./shopify');
 
 async function syncAllPrices() {
@@ -33,24 +33,17 @@ async function syncAllPrices() {
     try {
       console.log(`Syncing: ${product.title}`);
 
-      let freshCard = null;
-
-      // Prefer fetching by Collectr URL (most accurate)
-      if (product.collectrUrl) {
-        freshCard = await getCardDetails(product.collectrUrl);
-      }
-
-      // Fallback: search by title
-      if (!freshCard && product.title) {
-        const searchResults = await searchCards(product.title);
-        if (searchResults.length > 0) {
-          // Pick the best match (first result)
-          freshCard = searchResults[0];
-        }
-      }
+      const freshCard = await resolveCardForSync({
+        collectrId: product.collectrId,
+        collectrUrl: product.collectrUrl,
+        title: product.title,
+        subType: product.subType,
+      });
 
       if (!freshCard || freshCard.price === 0) {
-        throw new Error('Could not fetch price from Collectr');
+        throw new Error(
+          'Could not fetch price from Collectr (wrong variant or missing collectr_id — re-add card from search)'
+        );
       }
 
       const newPrice = await updateProductPrice(

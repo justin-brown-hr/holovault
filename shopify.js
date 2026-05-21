@@ -59,7 +59,7 @@ async function createProduct(card, multiplier = 1.0) {
 
   const body = {
     product: {
-      title: card.name,
+      title: buildProductTitle(card),
       body_html: buildDescription(card),
       vendor: card.setName || 'Pokemon TCG',
       product_type: 'Pokemon Card',
@@ -118,6 +118,7 @@ async function setProductMetafields(productId, card, multiplier) {
     { namespace: 'custom', key: 'multiplier', value: multiplier.toString(), type: 'number_decimal' },
     { namespace: 'custom', key: 'collectr_id', value: card.collectrId ? card.collectrId.toString() : '', type: 'single_line_text_field' },
     { namespace: 'custom', key: 'collectr_url', value: card.collectrUrl || '', type: 'single_line_text_field' },
+    { namespace: 'custom', key: 'card_sub_type', value: card.subType || '', type: 'single_line_text_field' },
     { namespace: 'custom', key: 'last_synced', value: new Date().toISOString(), type: 'single_line_text_field' },
   ];
 
@@ -158,6 +159,7 @@ async function getManagedProducts() {
     const collectrId = metafields.find((m) => m.key === 'collectr_id');
     const collectrUrl = metafields.find((m) => m.key === 'collectr_url');
     const multiplier = metafields.find((m) => m.key === 'multiplier');
+    const subType = metafields.find((m) => m.key === 'card_sub_type');
 
     result.push({
       productId: product.id,
@@ -165,6 +167,7 @@ async function getManagedProducts() {
       title: product.title,
       collectrId: collectrId?.value || null,
       collectrUrl: collectrUrl?.value || null,
+      subType: subType?.value || null,
       multiplier: multiplier ? parseFloat(multiplier.value) : 1.0,
     });
   }
@@ -189,8 +192,17 @@ async function setMultiplier(productId, multiplier) {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+function buildProductTitle(card) {
+  const name = (card.name || '').trim();
+  const sub = (card.subType || '').trim();
+  if (!sub) return name;
+  if (name.toLowerCase().includes(sub.toLowerCase())) return name;
+  return `${name} — ${sub}`;
+}
+
 function buildDescription(card) {
   const parts = [];
+  if (card.subType) parts.push(`<strong>Finish:</strong> ${card.subType}`);
   if (card.setName) parts.push(`<strong>Set:</strong> ${card.setName}`);
   if (card.cardNumber) parts.push(`<strong>Number:</strong> ${card.cardNumber}`);
   if (card.rarity) parts.push(`<strong>Rarity:</strong> ${card.rarity}`);

@@ -127,11 +127,17 @@ app.patch('/api/products/:id/multiplier', requireToken, async (req, res) => {
 });
 
 app.post('/api/sync', requireToken, async (req, res) => {
-  res.json({ success: true, message: 'Sync started. Check server logs.' });
   try {
-    await syncAllPrices();
+    const results = await syncAllPrices();
+    res.json({
+      success: true,
+      updated: results.success,
+      failed: results.failed,
+      errors: results.errors,
+    });
   } catch (err) {
     console.error('Sync error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
