@@ -246,6 +246,7 @@
       flex: 1;
       overflow-y: auto;
       padding: 16px;
+      padding-bottom: 80px;
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
       gap: 14px;
@@ -284,17 +285,15 @@
     }
 
     .bulk-bar {
-      display: none;
+      display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 10px;
-      padding: 12px 16px;
-      margin: 0 16px 12px;
-      background: #1a1a2e;
-      border: 1px solid #333;
-      border-radius: 8px;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid #333;
     }
-    .bulk-bar.visible { display: flex; }
+    .bulk-bar--idle .bulk-btn-primary { opacity: 0.45; pointer-events: none; }
     .bulk-bar label { font-size: 0.8rem; color: #aaa; }
     .bulk-bar input[type="number"] {
       width: 64px;
@@ -314,10 +313,54 @@
       font-weight: 600;
       cursor: pointer;
     }
+    .bulk-btn-primary {
+      background: #16a34a;
+      font-size: 0.9rem;
+      padding: 10px 18px;
+    }
+    .bulk-btn-primary:hover { background: #15803d; }
     .bulk-btn:hover { background: #3a6a8a; }
     .bulk-btn:disabled { background: #444; cursor: not-allowed; }
     .bulk-btn.secondary { background: #333; border: 1px solid #555; }
     .bulk-hint { font-size: 0.75rem; color: #888; flex: 1 1 100%; }
+    .card-select {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.72rem;
+      color: #aaa;
+      margin-bottom: 6px;
+      cursor: pointer;
+    }
+    .card-select input { cursor: pointer; accent-color: #16a34a; }
+    .bulk-select-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 0.8rem;
+      color: #aaa;
+    }
+    .bulk-select-row a { color: #60a5fa; cursor: pointer; }
+
+    .import-queue {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #1a1a2e;
+      border-top: 2px solid #16a34a;
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 500;
+      transform: translateY(100%);
+      transition: transform 0.25s;
+    }
+    .import-queue.visible { transform: translateY(0); }
+    .import-queue strong { color: #fff; }
+    .import-queue .bulk-btn-primary { padding: 10px 24px; }
 
     .bulk-overlay {
       display: none;
@@ -467,13 +510,21 @@
         />
         <button id="search-btn" onclick="doSearch()">Search</button>
       </div>
-    </div>
-    <div class="bulk-bar" id="bulk-bar">
-      <label>Default ×</label>
-      <input type="number" id="bulk-multiplier" value="1.00" min="0.01" max="10" step="0.05" />
-      <button type="button" class="bulk-btn" id="bulk-add-new-btn" onclick="bulkAdd(true)">Add all new</button>
-      <button type="button" class="bulk-btn secondary" id="bulk-add-all-btn" onclick="bulkAdd(false)">Add all results</button>
-      <span class="bulk-hint" id="bulk-hint">Processes on server one-by-one (~3s/card). Stay on this tab until done.</span>
+      <div class="bulk-bar bulk-bar--idle" id="bulk-bar">
+        <button type="button" class="bulk-btn bulk-btn-primary" id="bulk-add-selected-btn" onclick="bulkAddSelected()">
+          Import selected to Shopify
+        </button>
+        <button type="button" class="bulk-btn" id="bulk-add-new-btn" onclick="bulkAdd(true)">All new only</button>
+        <button type="button" class="bulk-btn secondary" id="bulk-queue-btn" onclick="addSelectedToQueue()">Add selected to queue</button>
+        <label>×</label>
+        <input type="number" id="bulk-multiplier" value="1.00" min="0.01" max="10" step="0.05" />
+        <div class="bulk-select-row">
+          <label><input type="checkbox" id="select-all-cards" onchange="toggleSelectAll(this.checked)" /> Select all</label>
+          <a onclick="selectNewOnly()">New only</a>
+          <a onclick="clearSelection()">Clear</a>
+        </div>
+        <span class="bulk-hint" id="bulk-hint">Search first, then use Import selected — no need to click each card. ~3 sec per card.</span>
+      </div>
     </div>
     <div id="search-results"><div class="empty-state">Search for a card to get started.</div></div>
   </div>
@@ -489,10 +540,18 @@
   </div>
 </div>
 
+<div class="import-queue" id="import-queue">
+  <span>Queue: <strong id="queue-count">0</strong> cards ready</span>
+  <button type="button" class="bulk-btn bulk-btn-primary" onclick="importQueue()">Import queue to Shopify</button>
+  <button type="button" class="bulk-btn secondary" onclick="clearQueue()">Clear queue</button>
+</div>
+
 <div id="toast"></div>
 
 <script>
   let searchResults = [];
+  let selectedIndices = new Set();
+  let importQueueCards = [];
   let managedByCollectrId = {};
   let loadProductsTimer = null;
 
@@ -521,6 +580,10 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Search failed');
       searchResults = data.cards || [];
+      selectedIndices = new Set();
+      searchResults.forEach((c, i) => {
+        if (isNewCard(c)) selectedIndices.add(i);
+      });
       updateBulkBar();
       renderSearchResults(searchResults);
     } catch (err) {
@@ -539,38 +602,127 @@
     }).length;
   }
 
-  function updateBulkBar() {
-    const bar = document.getElementById('bulk-bar');
-    if (!searchResults.length) {
-      bar.classList.remove('visible');
-      return;
-    }
-    bar.classList.add('visible');
-    const newCount = countNewCards();
-    document.getElementById('bulk-add-new-btn').textContent =
-      newCount > 0 ? `Add all new (${newCount})` : 'Add all new (0)';
-    document.getElementById('bulk-add-all-btn').textContent =
-      `Add all results (${searchResults.length})`;
-    document.getElementById('bulk-hint').textContent =
-      `~${Math.ceil(searchResults.length * 3 / 60)} min for full batch at Shopify rate limits. Use "Add all new" to skip listings already on the store.`;
+  function isNewCard(card) {
+    if (!card.collectrId) return false;
+    return !managedByCollectrId[listingKey(card.collectrId, card.subType)];
   }
 
-  async function bulkAdd(onlyNew) {
-    if (!searchResults.length) return showToast('Search for cards first.', 'error');
-
-    const cards = searchResults.map((card, i) => {
-      const multEl = document.getElementById(`mult-${i}`);
-      const mult = multEl ? parseFloat(multEl.value) : parseFloat(document.getElementById('bulk-multiplier').value);
-      return { ...card, _multiplier: mult };
-    });
-
-    const count = onlyNew ? countNewCards() : cards.length;
-    if (onlyNew && count === 0) return showToast('All search results are already on the store.', 'error');
-
+  function cardsFromIndices(indices) {
     const defaultMult = parseFloat(document.getElementById('bulk-multiplier').value) || 1;
-    const msg = onlyNew
-      ? `Add ${count} new cards to Shopify? (skips ones already listed)`
-      : `Add all ${cards.length} cards? Existing listings will get +1 stock.`;
+    return [...indices].map((i) => {
+      const card = searchResults[i];
+      const multEl = document.getElementById(`mult-${i}`);
+      const mult = multEl ? parseFloat(multEl.value) : defaultMult;
+      return { ...card, _multiplier: mult };
+    }).filter((c) => c && c.collectrId);
+  }
+
+  function updateBulkBar() {
+    const bar = document.getElementById('bulk-bar');
+    const hasSearch = searchResults.length > 0;
+    bar.classList.toggle('bulk-bar--idle', !hasSearch);
+
+    const sel = selectedIndices.size;
+    const newCount = countNewCards();
+    document.getElementById('bulk-add-selected-btn').textContent =
+      hasSearch ? `Import selected (${sel})` : 'Import selected to Shopify';
+    document.getElementById('bulk-add-new-btn').textContent =
+      newCount > 0 ? `All new only (${newCount})` : 'All new only (0)';
+    document.getElementById('bulk-hint').textContent = hasSearch
+      ? `${searchResults.length} results · ${sel} selected · ~${Math.ceil(sel * 3)}s for selected · Use queue to combine multiple searches`
+      : 'Search Collectr, tick cards (or Select all), then Import selected — no need to click each Add button.';
+    document.getElementById('select-all-cards').checked =
+      hasSearch && sel === searchResults.length;
+  }
+
+  function toggleSelectAll(checked) {
+    selectedIndices = new Set();
+    if (checked) searchResults.forEach((_, i) => selectedIndices.add(i));
+    updateBulkBar();
+    renderSearchResults(searchResults);
+  }
+
+  function selectNewOnly() {
+    selectedIndices = new Set();
+    searchResults.forEach((c, i) => {
+      if (isNewCard(c)) selectedIndices.add(i);
+    });
+    updateBulkBar();
+    renderSearchResults(searchResults);
+  }
+
+  function clearSelection() {
+    selectedIndices.clear();
+    updateBulkBar();
+    renderSearchResults(searchResults);
+  }
+
+  function toggleCardSelect(i, checked) {
+    if (checked) selectedIndices.add(i);
+    else selectedIndices.delete(i);
+    updateBulkBar();
+  }
+
+  function updateQueueUI() {
+    const el = document.getElementById('import-queue');
+    document.getElementById('queue-count').textContent = importQueueCards.length;
+    el.classList.toggle('visible', importQueueCards.length > 0);
+  }
+
+  function queueKey(card) {
+    return listingKey(card.collectrId, card.subType);
+  }
+
+  function addSelectedToQueue() {
+    const cards = cardsFromIndices(selectedIndices);
+    if (!cards.length) return showToast('Select at least one card.', 'error');
+    const existing = new Set(importQueueCards.map(queueKey));
+    let added = 0;
+    for (const card of cards) {
+      const k = queueKey(card);
+      if (!existing.has(k)) {
+        importQueueCards.push(card);
+        existing.add(k);
+        added++;
+      }
+    }
+    updateQueueUI();
+    showToast(`Added ${added} to queue (${importQueueCards.length} total). Search again to add more sets.`, 'success');
+  }
+
+  function clearQueue() {
+    importQueueCards = [];
+    updateQueueUI();
+  }
+
+  function importQueue() {
+    if (!importQueueCards.length) return showToast('Queue is empty.', 'error');
+    runBulkImport(importQueueCards, false).then(() => {
+      importQueueCards = [];
+      updateQueueUI();
+    });
+  }
+
+  function bulkAddSelected() {
+    const cards = cardsFromIndices(selectedIndices);
+    if (!cards.length) return showToast('Select cards to import (checkbox on each card).', 'error');
+    return runBulkImport(cards, false);
+  }
+
+  function bulkAdd(onlyNew) {
+    if (!searchResults.length) return showToast('Search for cards first.', 'error');
+    const cards = cardsFromIndices(
+      onlyNew
+        ? new Set(searchResults.map((c, i) => (isNewCard(c) ? i : -1)).filter((i) => i >= 0))
+        : new Set(searchResults.map((_, i) => i))
+    );
+    if (!cards.length) return showToast('All results already on the store.', 'error');
+    return runBulkImport(cards, onlyNew);
+  }
+
+  async function runBulkImport(cards, onlyNew) {
+    const defaultMult = parseFloat(document.getElementById('bulk-multiplier').value) || 1;
+    const msg = `Import ${cards.length} cards to Shopify? (~${Math.ceil(cards.length * 3)} seconds)`;
     if (!confirm(msg)) return;
 
     const overlay = document.getElementById('bulk-overlay');
@@ -579,17 +731,19 @@
     const estimateEl = document.getElementById('bulk-estimate');
     overlay.classList.add('visible');
     bar.style.width = '5%';
-    statusEl.textContent = `Sending ${onlyNew ? count : cards.length} cards to server…`;
-    estimateEl.textContent = `Estimated ~${Math.ceil((onlyNew ? count : cards.length) * 3)} seconds`;
+    statusEl.textContent = `Importing ${cards.length} cards…`;
+    estimateEl.textContent = `Please keep this tab open`;
 
-    document.getElementById('bulk-add-new-btn').disabled = true;
-    document.getElementById('bulk-add-all-btn').disabled = true;
-    document.getElementById('search-btn').disabled = true;
+    const disable = (on) => {
+      ['bulk-add-selected-btn', 'bulk-add-new-btn', 'bulk-queue-btn', 'search-btn'].forEach((id) => {
+        document.getElementById(id).disabled = on;
+      });
+    };
+    disable(true);
 
     const BATCH = 50;
     const chunks = [];
     for (let i = 0; i < cards.length; i += BATCH) chunks.push(cards.slice(i, i + BATCH));
-
     const totals = { added: 0, incremented: 0, skipped: 0, failed: 0, durationMs: 0, errors: [] };
 
     try {
@@ -604,7 +758,7 @@
           body: JSON.stringify({ cards: chunk, multiplier: defaultMult, onlyNew }),
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Bulk add failed');
+        if (!res.ok) throw new Error(data.error || 'Bulk import failed');
 
         totals.added += data.added || 0;
         totals.incremented += data.incremented || 0;
@@ -615,21 +769,22 @@
         bar.style.width = `${Math.round(((c + 1) / chunks.length) * 100)}%`;
       }
 
-      const summary = `Done in ${(totals.durationMs / 1000).toFixed(0)}s — ${totals.added} new, ${totals.incremented} stock+1, ${totals.skipped} skipped, ${totals.failed} failed`;
+      const summary = `Done — ${totals.added} new, ${totals.incremented} stock+1, ${totals.skipped} skipped, ${totals.failed} failed`;
       statusEl.textContent = summary;
       showToast(summary, totals.failed ? 'error' : 'success');
       if (totals.errors.length) console.warn('Bulk errors:', totals.errors);
       await loadProducts();
-      renderSearchResults(searchResults);
+      if (searchResults.length) {
+        selectNewOnly();
+        renderSearchResults(searchResults);
+      }
       updateBulkBar();
     } catch (err) {
       statusEl.textContent = err.message;
       showToast(err.message, 'error');
     } finally {
-      setTimeout(() => overlay.classList.remove('visible'), 2000);
-      document.getElementById('bulk-add-new-btn').disabled = false;
-      document.getElementById('bulk-add-all-btn').disabled = false;
-      document.getElementById('search-btn').disabled = false;
+      setTimeout(() => overlay.classList.remove('visible'), 2500);
+      disable(false);
       bar.style.width = '0%';
     }
   }
@@ -653,10 +808,15 @@
         : '';
       const btnLabel = existing ? '+ Add another (qty +1)' : '+ Add to Shopify';
       const btnClass = existing ? 'add-card-btn already' : 'add-card-btn';
+      const checked = selectedIndices.has(i) ? 'checked' : '';
       return `
         <div class="card-item">
           <img src="${escHtml(imgSrc)}" alt="${escHtml(card.name)}" loading="lazy" onerror="this.src='https://placehold.co/160x213?text=No+Image'" />
           <div class="card-info">
+            <label class="card-select">
+              <input type="checkbox" ${checked} onchange="toggleCardSelect(${i}, this.checked)" />
+              Select
+            </label>
             <div class="card-name">${escHtml(card.name)}</div>
             ${card.subType ? `<div class="card-finish">${escHtml(card.subType)}</div>` : ''}
             ${alreadyHtml}
