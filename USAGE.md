@@ -75,7 +75,7 @@ Collectr often uses the **same product ID** for Foil and Normal with different *
 
 | Task | How |
 |------|-----|
-| Update prices | **⟳ Sync Prices Now** (or wait for daily 6:00 UTC cron) |
+| Update prices | **⟳ Sync Prices Now** — shows live progress (card X of Y, updated/failed counts) |
 | Change markup on one card | Left panel → edit **×** → **Save** |
 | Add another copy in stock | Search same card + finish → **Import selected** or **+ Add** (qty +1) |
 | Remove one listing | Left panel → **Delete** on that product |

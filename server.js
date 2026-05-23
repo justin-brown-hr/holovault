@@ -202,19 +202,43 @@ app.patch('/api/products/:id/multiplier', requireToken, async (req, res) => {
   }
 });
 
+function writeSse(res, data) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
 app.post('/api/sync', requireToken, async (req, res) => {
-  try {
-    const results = await syncAllPrices();
-    res.json({
-      success: true,
-      updated: results.success,
-      failed: results.failed,
-      errors: results.errors,
-    });
-  } catch (err) {
-    console.error('Sync error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+  const useStream =
+    req.query.stream === '1' || String(req.headers.accept || '').includes('text/event-stream');
+
+  if (!useStream) {
+    try {
+      const results = await syncAllPrices();
+      res.json({
+        success: true,
+        updated: results.success,
+        failed: results.failed,
+        errors: results.errors,
+      });
+    } catch (err) {
+      console.error('Sync error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+    return;
   }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (res.flushHeaders) res.flushHeaders();
+
+  try {
+    await syncAllPrices((event) => writeSse(res, event));
+  } catch (err) {
+    console.error('Sync stream error:', err.message);
+    writeSse(res, { type: 'error', error: err.message });
+  }
+  res.end();
 });
 
 // ── Cron ──────────────────────────────────────────────────────────────────────

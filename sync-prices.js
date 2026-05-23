@@ -10,8 +10,13 @@
 const { resolveCardForSync, closeBrowser } = require('./collectr');
 const { getManagedProducts, updateProductPrice } = require('./shopify');
 
-async function syncAllPrices() {
+async function syncAllPrices(onProgress) {
+  const emit = (payload) => {
+    if (typeof onProgress === 'function') onProgress(payload);
+  };
+
   console.log(`[${new Date().toISOString()}] Starting price sync...`);
+  emit({ type: 'phase', message: 'Loading products from Shopify…' });
 
   let products;
   try {
@@ -19,17 +24,34 @@ async function syncAllPrices() {
     console.log(`Found ${products.length} managed products to sync.`);
   } catch (err) {
     console.error('Failed to fetch managed products from Shopify:', err.message);
-    process.exit(1);
+    if (require.main === module) process.exit(1);
+    throw err;
   }
 
   if (products.length === 0) {
     console.log('No managed products found. Add cards via the admin UI first.');
-    return;
+    emit({ type: 'done', success: 0, failed: 0, errors: [], total: 0 });
+    return { success: 0, failed: 0, errors: [] };
   }
 
+  const total = products.length;
   const results = { success: 0, failed: 0, errors: [] };
+  emit({ type: 'start', total });
 
-  for (const product of products) {
+  for (let i = 0; i < products.length; i++) {
+    const product = products[i];
+    const current = i + 1;
+
+    emit({
+      type: 'progress',
+      current,
+      total,
+      title: product.title,
+      phase: 'collectr',
+      updated: results.success,
+      failed: results.failed,
+    });
+
     try {
       console.log(`Syncing: ${product.title}`);
 
@@ -46,6 +68,16 @@ async function syncAllPrices() {
         );
       }
 
+      emit({
+        type: 'progress',
+        current,
+        total,
+        title: product.title,
+        phase: 'shopify',
+        updated: results.success,
+        failed: results.failed,
+      });
+
       const newPrice = await updateProductPrice(
         product.productId,
         product.variantId,
@@ -56,12 +88,33 @@ async function syncAllPrices() {
       console.log(`  ✓ ${product.title}: $${newPrice} (market: $${freshCard.price}, multiplier: ${product.multiplier}x)`);
       results.success++;
 
-      // Small delay to avoid hammering Collectr
+      emit({
+        type: 'item',
+        current,
+        total,
+        title: product.title,
+        ok: true,
+        price: newPrice,
+        updated: results.success,
+        failed: results.failed,
+      });
+
       await sleep(1500);
     } catch (err) {
       console.error(`  ✗ ${product.title}: ${err.message}`);
       results.failed++;
       results.errors.push({ product: product.title, error: err.message });
+
+      emit({
+        type: 'item',
+        current,
+        total,
+        title: product.title,
+        ok: false,
+        error: err.message,
+        updated: results.success,
+        failed: results.failed,
+      });
     }
   }
 
@@ -73,6 +126,7 @@ async function syncAllPrices() {
     results.errors.forEach((e) => console.log(`  - ${e.product}: ${e.error}`));
   }
 
+  emit({ type: 'done', total, updated: results.success, failed: results.failed, errors: results.errors });
   return results;
 }
 

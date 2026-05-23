@@ -382,6 +382,18 @@
       justify-content: center;
     }
     .bulk-overlay.visible { display: flex; }
+    .progress-detail {
+      font-size: 0.85rem;
+      color: #93c5fd;
+      margin-bottom: 10px;
+      min-height: 1.2em;
+      word-break: break-word;
+    }
+    .progress-stats {
+      font-size: 0.8rem;
+      color: #4ade80;
+      margin-top: 8px;
+    }
     .bulk-modal {
       background: #1a1a2e;
       border: 1px solid #444;
@@ -542,12 +554,14 @@
 
 </div>
 
-<div class="bulk-overlay" id="bulk-overlay">
+<div class="bulk-overlay" id="progress-overlay">
   <div class="bulk-modal">
-    <h3>Adding cards to Shopify</h3>
-    <p id="bulk-status">Starting…</p>
-    <div class="bulk-progress"><div class="bulk-progress__bar" id="bulk-progress-bar"></div></div>
-    <p id="bulk-estimate" style="font-size:0.8rem;color:#666"></p>
+    <h3 id="progress-title">Working…</h3>
+    <p id="progress-status">Starting…</p>
+    <p id="progress-detail" class="progress-detail"></p>
+    <div class="bulk-progress"><div class="bulk-progress__bar" id="progress-bar"></div></div>
+    <p id="progress-stats" class="progress-stats"></p>
+    <p id="progress-estimate" style="font-size:0.8rem;color:#666"></p>
   </div>
 </div>
 
@@ -736,14 +750,12 @@
     const msg = `Import ${cards.length} cards to Shopify? (~${Math.ceil(cards.length * 3)} seconds)`;
     if (!confirm(msg)) return;
 
-    const overlay = document.getElementById('bulk-overlay');
-    const statusEl = document.getElementById('bulk-status');
-    const bar = document.getElementById('bulk-progress-bar');
-    const estimateEl = document.getElementById('bulk-estimate');
-    overlay.classList.add('visible');
-    bar.style.width = '5%';
-    statusEl.textContent = `Importing ${cards.length} cards…`;
-    estimateEl.textContent = `Please keep this tab open`;
+    showProgressModal({
+      title: 'Adding cards to Shopify',
+      status: `Importing ${cards.length} cards…`,
+      estimate: 'Please keep this tab open',
+    });
+    const bar = document.getElementById('progress-bar');
 
     const disable = (on) => {
       ['bulk-add-selected-btn', 'bulk-add-new-btn', 'bulk-queue-btn', 'search-btn'].forEach((id) => {
@@ -760,8 +772,10 @@
     try {
       for (let c = 0; c < chunks.length; c++) {
         const chunk = chunks[c];
-        statusEl.textContent = `Batch ${c + 1} of ${chunks.length} (${chunk.length} cards)…`;
-        bar.style.width = `${Math.round(((c + 0.2) / chunks.length) * 100)}%`;
+        setProgress({
+          status: `Batch ${c + 1} of ${chunks.length} (${chunk.length} cards)…`,
+          percent: Math.round(((c + 0.2) / chunks.length) * 100),
+        });
 
         const res = await fetch('/api/bulk-add', {
           method: 'POST',
@@ -777,11 +791,11 @@
         totals.failed += data.failed || 0;
         totals.durationMs += data.durationMs || 0;
         if (data.errors?.length) totals.errors.push(...data.errors);
-        bar.style.width = `${Math.round(((c + 1) / chunks.length) * 100)}%`;
+        setProgress({ percent: Math.round(((c + 1) / chunks.length) * 100) });
       }
 
       const summary = `Done — ${totals.added} new, ${totals.incremented} stock+1, ${totals.skipped} skipped, ${totals.failed} failed`;
-      statusEl.textContent = summary;
+      setProgress({ status: summary, percent: 100 });
       showToast(summary, totals.failed ? 'error' : 'success');
       if (totals.errors.length) console.warn('Bulk errors:', totals.errors);
       await loadProducts();
@@ -791,12 +805,56 @@
       }
       updateBulkBar();
     } catch (err) {
-      statusEl.textContent = err.message;
+      setProgress({ status: err.message, percent: 0 });
       showToast(err.message, 'error');
     } finally {
-      setTimeout(() => overlay.classList.remove('visible'), 2500);
+      setTimeout(hideProgressModal, 2500);
       disable(false);
-      bar.style.width = '0%';
+    }
+  }
+
+  function showProgressModal({ title, status, estimate, detail, stats }) {
+    document.getElementById('progress-title').textContent = title || 'Working…';
+    document.getElementById('progress-status').textContent = status || 'Starting…';
+    document.getElementById('progress-detail').textContent = detail || '';
+    document.getElementById('progress-stats').textContent = stats || '';
+    document.getElementById('progress-estimate').textContent = estimate || '';
+    document.getElementById('progress-bar').style.width = '0%';
+    document.getElementById('progress-overlay').classList.add('visible');
+  }
+
+  function setProgress({ status, detail, stats, percent, estimate }) {
+    if (status != null) document.getElementById('progress-status').textContent = status;
+    if (detail != null) document.getElementById('progress-detail').textContent = detail;
+    if (stats != null) document.getElementById('progress-stats').textContent = stats;
+    if (estimate != null) document.getElementById('progress-estimate').textContent = estimate;
+    if (percent != null) document.getElementById('progress-bar').style.width = `${percent}%`;
+  }
+
+  function hideProgressModal() {
+    document.getElementById('progress-overlay').classList.remove('visible');
+    document.getElementById('progress-bar').style.width = '0%';
+  }
+
+  async function readSseStream(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+      for (const part of parts) {
+        const line = part.split('\n').find((l) => l.startsWith('data: '));
+        if (!line) continue;
+        try {
+          onEvent(JSON.parse(line.slice(6)));
+        } catch (e) {
+          console.warn('SSE parse error', e);
+        }
+      }
     }
   }
 
@@ -992,19 +1050,78 @@
     const btn = document.getElementById('sync-btn');
     btn.disabled = true;
     btn.textContent = 'Syncing...';
+
+    showProgressModal({
+      title: 'Syncing prices from Collectr',
+      status: 'Starting…',
+      estimate: '~2 seconds per card — keep this tab open',
+    });
+
     try {
-      const res = await fetch('/api/sync', { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Sync failed');
-      const msg = data.failed
-        ? `Sync done: ${data.updated} updated, ${data.failed} failed.`
-        : `Sync done: ${data.updated} prices updated.`;
-      showToast(msg, data.failed ? 'error' : 'success');
-      if (data.errors?.length) console.warn('Sync errors:', data.errors);
+      const res = await fetch('/api/sync?stream=1', {
+        method: 'POST',
+        headers: { Accept: 'text/event-stream' },
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Sync failed');
+      }
+
+      let finalResult = null;
+
+      await readSseStream(res, (evt) => {
+        if (evt.type === 'phase') {
+          setProgress({ status: evt.message, percent: 2 });
+        } else if (evt.type === 'start') {
+          setProgress({
+            status: `Syncing ${evt.total} products…`,
+            percent: 0,
+            stats: `0 updated · 0 failed`,
+          });
+        } else if (evt.type === 'progress') {
+          const pct = evt.total ? Math.round((evt.current / evt.total) * 100) : 0;
+          const phase =
+            evt.phase === 'collectr' ? 'Fetching Collectr price…' : 'Updating Shopify…';
+          setProgress({
+            status: `Card ${evt.current} of ${evt.total}`,
+            detail: `${phase} ${evt.title}`,
+            stats: `${evt.updated} updated · ${evt.failed} failed`,
+            percent: pct,
+          });
+        } else if (evt.type === 'item') {
+          const pct = evt.total ? Math.round((evt.current / evt.total) * 100) : 0;
+          setProgress({
+            stats: `${evt.updated} updated · ${evt.failed} failed`,
+            percent: pct,
+            detail: evt.ok
+              ? `✓ ${evt.title} → $${evt.price}`
+              : `✗ ${evt.title}`,
+          });
+        } else if (evt.type === 'done') {
+          finalResult = evt;
+          const msg = `Done — ${evt.updated} updated, ${evt.failed} failed`;
+          setProgress({ status: msg, percent: 100, detail: '', stats: msg });
+        } else if (evt.type === 'error') {
+          throw new Error(evt.error || 'Sync failed');
+        }
+      });
+
+      if (finalResult) {
+        showToast(
+          finalResult.failed
+            ? `Sync done: ${finalResult.updated} updated, ${finalResult.failed} failed.`
+            : `Sync done: ${finalResult.updated} prices updated.`,
+          finalResult.failed ? 'error' : 'success'
+        );
+        if (finalResult.errors?.length) console.warn('Sync errors:', finalResult.errors);
+      }
       scheduleLoadProducts();
     } catch (err) {
+      setProgress({ status: err.message, detail: '' });
       showToast(err.message, 'error');
     } finally {
+      setTimeout(hideProgressModal, 2000);
       btn.disabled = false;
       btn.textContent = '⟳ Sync Prices Now';
     }
