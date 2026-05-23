@@ -27,6 +27,9 @@ const CORE_COLLECTION_HANDLES = new Set([
 let cachedLocationId = null;
 let inventoryApiAvailable = null;
 
+/** In-process cache so immediate re-adds find the listing before Shopify search indexes metafields. */
+const collectrIdCache = new Map();
+
 const STOCK_SCOPE_HINT =
   'Enable Shopify Admin API scopes: read_locations, read_inventory, write_inventory (Dev Dashboard → app → Versions → scopes), then reinstall on the store.';
 
@@ -309,6 +312,8 @@ async function createProduct(card, multiplier = 1.0) {
   const product = res.data.product;
   const variant = product.variants[0];
 
+  await setProductMetafields(product.id, card, multiplier);
+
   let quantity = 1;
   if (useInventory) {
     const inventoryItemId = await resolveInventoryItemId(client, product.id, variant.id);
@@ -328,7 +333,22 @@ async function createProduct(card, multiplier = 1.0) {
     await setStockMetafield(product.id, 1);
   }
 
-  await setProductMetafields(product.id, card, multiplier);
+  const inventoryItemId = normalizeInventoryItemId(variant?.inventory_item_id)
+    || (await resolveInventoryItemId(client, product.id, variant.id));
+
+  cacheCollectrListing(card.collectrId, {
+    productId: product.id,
+    variantId: variant.id,
+    inventoryItemId,
+    inventoryManagement: useInventory ? 'shopify' : null,
+    inventoryQuantity: quantity,
+    title: product.title,
+    collectrId: String(card.collectrId),
+    collectrUrl: card.collectrUrl || null,
+    subType: card.subType || null,
+    multiplier,
+  });
+
   try {
     await ensureSetSmartCollection(card.setName);
   } catch (err) {
@@ -355,18 +375,85 @@ function legacyId(gidOrId) {
   return m ? m[1] : s;
 }
 
+function cacheCollectrListing(collectrId, listing) {
+  if (collectrId && listing) collectrIdCache.set(String(collectrId), listing);
+}
+
+function buildExistingListing(product, metafields) {
+  const variant = product.variants?.[0];
+  const collectrIdMf = metafields.find((m) => m.namespace === 'custom' && m.key === 'collectr_id');
+  const collectrUrlMf = metafields.find((m) => m.namespace === 'custom' && m.key === 'collectr_url');
+  const multiplierMf = metafields.find((m) => m.namespace === 'custom' && m.key === 'multiplier');
+  const subTypeMf = metafields.find((m) => m.namespace === 'custom' && m.key === 'card_sub_type');
+
+  return {
+    productId: product.id,
+    variantId: variant?.id,
+    inventoryItemId: normalizeInventoryItemId(variant?.inventory_item_id),
+    inventoryManagement: variant?.inventory_management,
+    inventoryQuantity: variant?.inventory_quantity ?? null,
+    title: product.title,
+    collectrId: collectrIdMf?.value || null,
+    collectrUrl: collectrUrlMf?.value || null,
+    subType: subTypeMf?.value || null,
+    multiplier: multiplierMf ? parseFloat(multiplierMf.value) : 1.0,
+  };
+}
+
+/** REST scan by collectr_id metafield (immediate; does not wait for Shopify search index). */
+async function findProductByCollectrIdRest(collectrId) {
+  const { client, BASE } = await getClient();
+  const target = String(collectrId);
+  let url = '/products.json?limit=250&fields=id,title,variants,tags';
+
+  while (url) {
+    const res = await client.get(url.startsWith('/') ? url : url.replace(BASE, ''));
+    for (const product of res.data.products) {
+      if (!product.tags?.includes('collectr-managed')) continue;
+      const mfRes = await client
+        .get(`/products/${product.id}/metafields.json`)
+        .catch(() => ({ data: { metafields: [] } }));
+      const mf = mfRes.data.metafields?.find(
+        (m) => m.namespace === 'custom' && m.key === 'collectr_id' && String(m.value) === target
+      );
+      if (mf) return buildExistingListing(product, mfRes.data.metafields);
+    }
+
+    const linkHeader = res.headers.link;
+    if (linkHeader?.includes('rel="next"')) {
+      const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+      url = match ? match[1].replace(BASE, '') : null;
+    } else {
+      url = null;
+    }
+  }
+  return null;
+}
+
 /**
- * Fast duplicate check (1 GraphQL request). Falls back to full scan if GraphQL unavailable.
+ * Find existing listing by Collectr product_id (cache → GraphQL → REST metafield scan).
  */
 async function findProductByCollectrId(collectrId) {
   if (!collectrId) return null;
-  try {
-    return await findProductByCollectrIdFast(collectrId);
-  } catch (err) {
-    console.warn('[Shopify] Fast collectr_id lookup failed, using full scan:', formatShopifyError(err));
-    const products = await getManagedProducts();
-    return products.find((p) => String(p.collectrId) === String(collectrId)) || null;
+  const key = String(collectrId);
+
+  if (collectrIdCache.has(key)) {
+    return collectrIdCache.get(key);
   }
+
+  let found = null;
+  try {
+    found = await findProductByCollectrIdFast(collectrId);
+  } catch (err) {
+    console.warn('[Shopify] GraphQL collectr_id lookup failed:', formatShopifyError(err));
+  }
+
+  if (!found) {
+    found = await findProductByCollectrIdRest(collectrId);
+  }
+
+  if (found) cacheCollectrListing(key, found);
+  return found;
 }
 
 async function findProductByCollectrIdFast(collectrId) {
@@ -403,7 +490,7 @@ async function findProductByCollectrIdFast(collectrId) {
 
   const variant = node.variants?.edges?.[0]?.node;
   const mfId = node.collectrId?.value;
-  if (mfId && String(mfId) !== String(collectrId)) return null;
+  if (!mfId || String(mfId) !== String(collectrId)) return null;
 
   return {
     productId: node.legacyResourceId,
@@ -478,8 +565,20 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
   }
 
   const res = await client.get(`/products/${existing.productId}.json`);
+  const updated = res.data.product;
+  const variant = updated.variants?.[0];
+  cacheCollectrListing(card.collectrId, {
+    ...existing,
+    productId: updated.id,
+    variantId: variant?.id,
+    inventoryItemId:
+      normalizeInventoryItemId(variant?.inventory_item_id) || existing.inventoryItemId,
+    inventoryQuantity: newQty,
+    title: updated.title,
+  });
+
   return {
-    product: res.data.product,
+    product: updated,
     quantity: newQty,
     incremented: true,
     price: finalPrice,
