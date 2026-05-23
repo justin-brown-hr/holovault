@@ -134,28 +134,60 @@ async function getUsdToNzdRate() {
   return 1.65;
 }
 
+/** REST inventory APIs need a numeric inventory item id (not a GID). */
+function normalizeInventoryItemId(id) {
+  if (id == null || id === '') return null;
+  const s = String(id).trim();
+  const gid = s.match(/InventoryItem\/(\d+)/i);
+  if (gid) return gid[1];
+  if (/^\d+$/.test(s)) return s;
+  return null;
+}
+
 async function getInventoryQuantity(inventoryItemId) {
+  const itemId = normalizeInventoryItemId(inventoryItemId);
+  if (!itemId) return 0;
   const { client } = await getClient();
   const locationId = await getPrimaryLocationId();
+  if (!locationId) return 0;
   const res = await client.get('/inventory_levels.json', {
-    params: { inventory_item_ids: inventoryItemId, location_ids: locationId },
+    params: { inventory_item_ids: itemId, location_ids: locationId },
   });
   const level = res.data.inventory_levels?.[0];
   return level ? level.available : 0;
 }
 
 async function setInventoryQuantity(inventoryItemId, quantity) {
+  const itemId = normalizeInventoryItemId(inventoryItemId);
+  if (!itemId) return null;
   const locationId = await getPrimaryLocationId();
   if (!locationId) return null;
   const { client } = await getClient();
   await client.post('/inventory_levels/set.json', {
-    inventory_level: {
-      location_id: locationId,
-      inventory_item_id: inventoryItemId,
-      available: Math.max(0, quantity),
-    },
+    location_id: locationId,
+    inventory_item_id: itemId,
+    available: Math.max(0, quantity),
   });
   return Math.max(0, quantity);
+}
+
+/** After product create, Shopify may not return inventory_item_id until tracking is enabled. */
+async function resolveInventoryItemId(client, productId, variantId) {
+  const fetchVariant = async () => {
+    const res = await client.get(`/products/${productId}.json`);
+    return res.data.product?.variants?.[0];
+  };
+
+  let variant = await fetchVariant();
+  let itemId = normalizeInventoryItemId(variant?.inventory_item_id);
+  if (itemId) return itemId;
+
+  if (variantId) {
+    await enableInventoryTracking(variantId);
+    variant = await fetchVariant();
+    itemId = normalizeInventoryItemId(variant?.inventory_item_id);
+  }
+  return itemId;
 }
 
 async function getStockMetafield(productId) {
@@ -278,10 +310,21 @@ async function createProduct(card, multiplier = 1.0) {
   const variant = product.variants[0];
 
   let quantity = 1;
-  if (useInventory && variant?.inventory_item_id) {
-    await setInventoryQuantity(variant.inventory_item_id, 1);
+  if (useInventory) {
+    const inventoryItemId = await resolveInventoryItemId(client, product.id, variant.id);
+    if (inventoryItemId) {
+      try {
+        await setInventoryQuantity(inventoryItemId, 1);
+      } catch (err) {
+        console.warn('[Shopify] Could not set inventory, using stock metafield:', formatShopifyError(err));
+        warning = STOCK_SCOPE_HINT;
+        await setStockMetafield(product.id, 1);
+      }
+    } else {
+      warning = STOCK_SCOPE_HINT;
+      await setStockMetafield(product.id, 1);
+    }
   } else {
-    warning = STOCK_SCOPE_HINT;
     await setStockMetafield(product.id, 1);
   }
 
@@ -340,7 +383,7 @@ async function findProductByCollectrIdFast(collectrId) {
                 node {
                   legacyResourceId
                   inventoryQuantity
-                  inventoryItem { legacyResourceId }
+                  inventoryItem { id }
                 }
               }
             }
@@ -365,7 +408,7 @@ async function findProductByCollectrIdFast(collectrId) {
   return {
     productId: node.legacyResourceId,
     variantId: variant?.legacyResourceId,
-    inventoryItemId: legacyId(variant?.inventoryItem?.legacyResourceId),
+    inventoryItemId: legacyId(variant?.inventoryItem?.id),
     inventoryManagement: variant?.inventoryItem ? 'shopify' : null,
     inventoryQuantity: variant?.inventoryQuantity ?? null,
     title: node.title,
@@ -388,24 +431,31 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
   if (useInventory) {
     let inventoryItemId = existing.inventoryItemId;
 
+    inventoryItemId = normalizeInventoryItemId(inventoryItemId);
     if (!inventoryItemId) {
-      const res = await client.get(`/products/${existing.productId}.json`);
-      const variant = res.data.product?.variants?.[0];
-      inventoryItemId = variant?.inventory_item_id;
-      if (variant?.id) await enableInventoryTracking(variant.id);
-    } else if (existing.inventoryManagement !== 'shopify') {
+      inventoryItemId = await resolveInventoryItemId(client, existing.productId, existing.variantId);
+    } else if (existing.inventoryManagement !== 'shopify' && existing.variantId) {
       await enableInventoryTracking(existing.variantId);
+      inventoryItemId = await resolveInventoryItemId(client, existing.productId, existing.variantId);
     }
 
-    if (!inventoryItemId) {
+    if (inventoryItemId) {
+      try {
+        const currentQty = await getInventoryQuantity(inventoryItemId);
+        newQty = currentQty + 1;
+        await setInventoryQuantity(inventoryItemId, newQty);
+      } catch (err) {
+        console.warn('[Shopify] Inventory bump failed, using stock metafield:', formatShopifyError(err));
+        const currentQty = await getStockMetafield(existing.productId);
+        newQty = currentQty + 1;
+        await setStockMetafield(existing.productId, newQty);
+        warning = STOCK_SCOPE_HINT;
+      }
+    } else {
       const currentQty = await getStockMetafield(existing.productId);
       newQty = currentQty + 1;
       await setStockMetafield(existing.productId, newQty);
       warning = STOCK_SCOPE_HINT;
-    } else {
-    const currentQty = await getInventoryQuantity(inventoryItemId);
-    newQty = currentQty + 1;
-    await setInventoryQuantity(inventoryItemId, newQty);
     }
   } else {
     const currentQty = await getStockMetafield(existing.productId);
