@@ -407,6 +407,12 @@
 <script>
   let searchResults = [];
   let managedByCollectrId = {};
+  let loadProductsTimer = null;
+
+  function scheduleLoadProducts() {
+    clearTimeout(loadProductsTimer);
+    loadProductsTimer = setTimeout(loadProducts, 500);
+  }
 
   function listingKey(collectrId, subType) {
     const sub = (subType || '').trim().toLowerCase().replace(/_/g, ' ');
@@ -504,7 +510,7 @@
         showToast(`"${card.name}" added at $${data.product.price} (qty 1)`, 'success');
       }
       if (data.warning) showToast(data.warning, 'error');
-      loadProducts();
+      scheduleLoadProducts();
       if (searchResults.length) renderSearchResults(searchResults);
     } catch (err) {
       btn.disabled = false;
@@ -575,7 +581,7 @@
       if (data.errors?.length) console.warn('Delete errors:', data.errors);
 
       managedByCollectrId = {};
-      loadProducts();
+      scheduleLoadProducts();
       if (searchResults.length) renderSearchResults(searchResults);
     } catch (err) {
       showToast(err.message, 'error');
@@ -633,7 +639,7 @@
         : `Sync done: ${data.updated} prices updated.`;
       showToast(msg, data.failed ? 'error' : 'success');
       if (data.errors?.length) console.warn('Sync errors:', data.errors);
-      loadProducts();
+      scheduleLoadProducts();
     } catch (err) {
       showToast(err.message, 'error');
     } finally {

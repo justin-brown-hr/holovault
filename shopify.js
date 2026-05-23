@@ -13,6 +13,7 @@ const {
   getAuthStatus,
   clearTokenCache,
 } = require('./shopify-auth');
+const { attachShopifyThrottle } = require('./shopify-throttle');
 
 const CORE_COLLECTION_HANDLES = new Set([
   'pokemon',
@@ -29,6 +30,13 @@ let inventoryApiAvailable = null;
 
 /** In-process cache so immediate re-adds find the listing before Shopify search indexes metafields. */
 const collectrIdCache = new Map();
+
+let managedProductsCache = { at: 0, data: null };
+const MANAGED_CACHE_MS = parseInt(process.env.MANAGED_PRODUCTS_CACHE_MS || '45000', 10);
+
+function invalidateManagedProductsCache() {
+  managedProductsCache = { at: 0, data: null };
+}
 
 const STOCK_SCOPE_HINT =
   'Enable Shopify Admin API scopes: read_locations, read_inventory, write_inventory (Dev Dashboard → app → Versions → scopes), then reinstall on the store.';
@@ -48,6 +56,9 @@ function formatShopifyError(err) {
   }
   if (status === 401) {
     return 'Shopify unauthorized (401). Check SHOPIFY_CLIENT_ID/SECRET or SHOPIFY_TOKEN in .env / Railway.';
+  }
+  if (status === 429) {
+    return 'Shopify rate limit — too many API calls. Wait a few seconds and try again.';
   }
   if (data?.errors) {
     return typeof data.errors === 'string' ? data.errors : JSON.stringify(data.errors);
@@ -102,6 +113,7 @@ async function getClient() {
     );
   }
 
+  attachShopifyThrottle(client);
   return { client, BASE };
 }
 
@@ -261,24 +273,57 @@ async function ensureSetSmartCollection(setName) {
   return res.data.smart_collection.id;
 }
 
+function formatSubTypeForStore(subType) {
+  if (!subType) return '';
+  return subType
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 async function setProductMetafields(productId, card, multiplier) {
   const { client } = await getClient();
+  const ownerId = `gid://shopify/Product/${productId}`;
+  const finish = formatSubTypeForStore(card.subType);
 
   const metafields = [
-    { namespace: 'custom', key: 'market_price', value: String(card.price || 0), type: 'number_decimal' },
-    { namespace: 'custom', key: 'market_price_nzd', value: String((card.price || 0) * multiplier), type: 'number_decimal' },
-    { namespace: 'custom', key: 'price_change', value: String(card.priceChange || 0), type: 'number_decimal' },
-    { namespace: 'custom', key: 'price_change_pct', value: String(card.priceChangePct || 0), type: 'number_decimal' },
-    { namespace: 'custom', key: 'multiplier', value: multiplier.toString(), type: 'number_decimal' },
-    { namespace: 'custom', key: 'collectr_id', value: card.collectrId ? card.collectrId.toString() : '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'collectr_url', value: card.collectrUrl || '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'card_sub_type', value: card.subType || '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'set_name', value: card.setName || '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'last_synced', value: new Date().toISOString(), type: 'single_line_text_field' },
-  ];
+    { namespace: 'custom', key: 'market_price', type: 'number_decimal', value: String(card.price || 0) },
+    {
+      namespace: 'custom',
+      key: 'market_price_nzd',
+      type: 'number_decimal',
+      value: String((card.price || 0) * multiplier),
+    },
+    { namespace: 'custom', key: 'price_change', type: 'number_decimal', value: String(card.priceChange || 0) },
+    {
+      namespace: 'custom',
+      key: 'price_change_pct',
+      type: 'number_decimal',
+      value: String(card.priceChangePct || 0),
+    },
+    { namespace: 'custom', key: 'multiplier', type: 'number_decimal', value: multiplier.toString() },
+    {
+      namespace: 'custom',
+      key: 'collectr_id',
+      type: 'single_line_text_field',
+      value: card.collectrId ? card.collectrId.toString() : '',
+    },
+    { namespace: 'custom', key: 'collectr_url', type: 'single_line_text_field', value: card.collectrUrl || '' },
+    { namespace: 'custom', key: 'card_sub_type', type: 'single_line_text_field', value: finish },
+    { namespace: 'custom', key: 'set_name', type: 'single_line_text_field', value: card.setName || '' },
+    { namespace: 'custom', key: 'last_synced', type: 'single_line_text_field', value: new Date().toISOString() },
+  ].map((mf) => ({ ...mf, ownerId }));
 
-  for (const mf of metafields) {
-    await client.post(`/products/${productId}/metafields.json`, { metafield: mf }).catch(() => {});
+  const mutation = `
+    mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphql(client, mutation, { metafields });
+  const errors = data?.metafieldsSet?.userErrors;
+  if (errors?.length) {
+    console.warn('[Shopify] metafieldsSet:', errors.map((e) => e.message).join('; '));
   }
 }
 
@@ -355,6 +400,7 @@ async function createProduct(card, multiplier = 1.0) {
     console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
   }
 
+  invalidateManagedProductsCache();
   return { product, quantity, incremented: false, warning };
 }
 
@@ -419,38 +465,15 @@ function buildExistingListing(product, metafields) {
   };
 }
 
-/** REST scan by collectr_id + finish/subType (immediate; does not wait for Shopify search index). */
-async function findExistingListingRest(card) {
-  const { client, BASE } = await getClient();
-  const targetId = String(card.collectrId);
-  let url = '/products.json?limit=250&fields=id,title,variants,tags';
-
-  while (url) {
-    const res = await client.get(url.startsWith('/') ? url : url.replace(BASE, ''));
-    for (const product of res.data.products) {
-      if (!product.tags?.includes('collectr-managed')) continue;
-      const mfRes = await client
-        .get(`/products/${product.id}/metafields.json`)
-        .catch(() => ({ data: { metafields: [] } }));
-      const metafields = mfRes.data.metafields || [];
-      const idMf = metafields.find(
-        (m) => m.namespace === 'custom' && m.key === 'collectr_id' && String(m.value) === targetId
-      );
-      const subMf = metafields.find((m) => m.namespace === 'custom' && m.key === 'card_sub_type');
-      if (idMf && subTypesMatch(subMf?.value, card.subType)) {
-        return buildExistingListing(product, metafields);
-      }
-    }
-
-    const linkHeader = res.headers.link;
-    if (linkHeader?.includes('rel="next"')) {
-      const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-      url = match ? match[1].replace(BASE, '') : null;
-    } else {
-      url = null;
-    }
-  }
-  return null;
+/** Scan cached managed list (no per-product REST calls). */
+async function findExistingListingFromCache(card) {
+  const products = await getManagedProductsCached();
+  return (
+    products.find(
+      (p) =>
+        String(p.collectrId) === String(card.collectrId) && subTypesMatch(p.subType, card.subType)
+    ) || null
+  );
 }
 
 function nodeToExistingListing(node, collectrId) {
@@ -491,7 +514,7 @@ async function findExistingListing(card) {
   }
 
   if (!found) {
-    found = await findExistingListingRest(card);
+    found = await findExistingListingFromCache(card);
   }
 
   if (found) cacheCollectrListing(card, found);
@@ -616,6 +639,7 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
     subType: card.subType || existing.subType,
   });
 
+  invalidateManagedProductsCache();
   return {
     product: updated,
     quantity: newQty,
@@ -662,66 +686,77 @@ async function updateProductPrice(productId, variantId, card, multiplier = 1.0) 
   return finalPrice;
 }
 
-async function getManagedProducts() {
-  const { client, BASE } = await getClient();
-  const products = [];
-  let url = '/products.json?limit=250&fields=id,title,variants,tags';
-
-  while (url) {
-    const res = await client.get(url.startsWith('/') ? url : url.replace(BASE, ''));
-    products.push(...res.data.products);
-
-    const linkHeader = res.headers['link'];
-    if (linkHeader && linkHeader.includes('rel="next"')) {
-      const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-      url = match ? match[1].replace(BASE, '') : null;
-    } else {
-      url = null;
-    }
+async function getManagedProductsCached() {
+  if (managedProductsCache.data && Date.now() - managedProductsCache.at < MANAGED_CACHE_MS) {
+    return managedProductsCache.data;
   }
+  const data = await getManagedProducts();
+  managedProductsCache = { at: Date.now(), data };
+  return data;
+}
 
-  const managed = products.filter((p) => p.tags && p.tags.includes('collectr-managed'));
-
-  const result = [];
-  for (const product of managed) {
-    const mfRes = await client
-      .get(`/products/${product.id}/metafields.json`)
-      .catch(() => ({ data: { metafields: [] } }));
-    const metafields = mfRes.data.metafields;
-
-    const collectrId = metafields.find((m) => m.key === 'collectr_id');
-    const collectrUrl = metafields.find((m) => m.key === 'collectr_url');
-    const multiplier = metafields.find((m) => m.key === 'multiplier');
-    const subType = metafields.find((m) => m.key === 'card_sub_type');
-    const variant = product.variants[0];
-
-    let inventoryQuantity = variant?.inventory_quantity ?? null;
-    if (variant?.inventory_item_id && variant.inventory_management === 'shopify' && inventoryApiAvailable !== false) {
-      try {
-        if (await checkInventoryApiAccess()) {
-          inventoryQuantity = await getInventoryQuantity(variant.inventory_item_id);
+async function getManagedProducts() {
+  const { client } = await getClient();
+  const query = `
+    query ManagedProducts($cursor: String) {
+      products(first: 50, query: "tag:collectr-managed", after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            legacyResourceId
+            title
+            variants(first: 1) {
+              edges {
+                node {
+                  legacyResourceId
+                  inventoryQuantity
+                  inventoryItem { id }
+                }
+              }
+            }
+            collectrId: metafield(namespace: "custom", key: "collectr_id") { value }
+            collectrUrl: metafield(namespace: "custom", key: "collectr_url") { value }
+            multiplier: metafield(namespace: "custom", key: "multiplier") { value }
+            subType: metafield(namespace: "custom", key: "card_sub_type") { value }
+            stockQty: metafield(namespace: "custom", key: "stock_qty") { value }
+          }
         }
-      } catch {
-        inventoryQuantity = variant.inventory_quantity;
       }
     }
-    if (inventoryQuantity == null || (inventoryApiAvailable === false && variant?.inventory_management !== 'shopify')) {
-      const metaQty = await getStockMetafield(product.id);
-      if (metaQty > 0) inventoryQuantity = metaQty;
-    }
+  `;
 
-    result.push({
-      productId: product.id,
-      variantId: variant?.id,
-      inventoryItemId: variant?.inventory_item_id,
-      inventoryManagement: variant?.inventory_management,
-      inventoryQuantity,
-      title: product.title,
-      collectrId: collectrId?.value || null,
-      collectrUrl: collectrUrl?.value || null,
-      subType: subType?.value || null,
-      multiplier: multiplier ? parseFloat(multiplier.value) : 1.0,
-    });
+  const result = [];
+  let cursor = null;
+  let hasNext = true;
+
+  while (hasNext) {
+    const data = await shopifyGraphql(client, query, { cursor });
+    const connection = data?.products;
+    for (const edge of connection?.edges || []) {
+      const node = edge?.node;
+      if (!node) continue;
+      const variant = node.variants?.edges?.[0]?.node;
+      let inventoryQuantity = variant?.inventoryQuantity ?? null;
+      const metaQty = node.stockQty?.value ? parseInt(node.stockQty.value, 10) : 0;
+      if ((inventoryQuantity == null || inventoryQuantity === 0) && metaQty > 0) {
+        inventoryQuantity = metaQty;
+      }
+
+      result.push({
+        productId: node.legacyResourceId,
+        variantId: variant?.legacyResourceId,
+        inventoryItemId: legacyId(variant?.inventoryItem?.id),
+        inventoryManagement: variant?.inventoryItem?.id ? 'shopify' : null,
+        inventoryQuantity,
+        title: node.title,
+        collectrId: node.collectrId?.value || null,
+        collectrUrl: node.collectrUrl?.value || null,
+        subType: node.subType?.value || null,
+        multiplier: node.multiplier?.value ? parseFloat(node.multiplier.value) : 1.0,
+      });
+    }
+    hasNext = connection?.pageInfo?.hasNextPage;
+    cursor = connection?.pageInfo?.endCursor || null;
   }
 
   return result;
@@ -741,7 +776,7 @@ async function setMultiplier(productId, multiplier) {
 
 function buildProductTitle(card) {
   const name = (card.name || '').trim();
-  const sub = (card.subType || '').trim();
+  const sub = formatSubTypeForStore(card.subType).trim();
   if (!sub) return name;
   if (name.toLowerCase().includes(sub.toLowerCase())) return name;
   return `${name} — ${sub}`;
@@ -806,6 +841,8 @@ async function deleteAllManagedProducts() {
     }
   }
 
+  invalidateManagedProductsCache();
+  collectrIdCache.clear();
   return results;
 }
 
@@ -814,6 +851,8 @@ module.exports = {
   addOrUpdateProduct,
   updateProductPrice,
   getManagedProducts,
+  getManagedProductsCached,
+  invalidateManagedProductsCache,
   findExistingListing,
   findProductByCollectrId,
   listingKey,

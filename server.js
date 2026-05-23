@@ -12,7 +12,7 @@ const cron = require('node-cron');
 const { searchCards, closeBrowser } = require('./collectr');
 const {
   addOrUpdateProduct,
-  getManagedProducts,
+  getManagedProductsCached,
   setMultiplier,
   deleteProduct,
   deleteAllManagedProducts,
@@ -133,7 +133,7 @@ app.post('/api/add-card', requireToken, async (req, res) => {
 
 app.get('/api/products', requireToken, async (req, res) => {
   try {
-    const products = await getManagedProducts();
+    const products = await getManagedProductsCached();
     res.json({ products });
   } catch (err) {
     console.error('Products error:', err.message);
