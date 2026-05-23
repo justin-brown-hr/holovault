@@ -1,12 +1,15 @@
 # Bulk adding many cards
 
+See **[USAGE.md](./USAGE.md)** for the full guide.
+
 ## In the Card Manager UI
 
 1. Search Collectr (e.g. set name or card name).
-2. Use the **bulk bar** under the search box:
-   - **Add all new (N)** — only cards not already on the store (recommended).
-   - **Add all results** — every row; existing listings get +1 stock.
-3. Set **Default ×** multiplier for the batch (per-card multipliers still apply if you edited them).
+2. Under the search box:
+   - **Import selected (N)** — main button (checked cards only).
+   - **All new only** — skip cards already on the store.
+   - **Add selected to queue** — combine several searches, then import from the bottom bar.
+3. Set **Default ×** multiplier (per-card **×** on each row still applies if edited).
 4. Wait for the progress modal — do not close the tab.
 
 Large imports run in **batches of 50** automatically to avoid Railway timeouts.

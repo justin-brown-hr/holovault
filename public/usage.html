@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Holo Vault — Usage</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; line-height: 1.6; max-width: 720px; margin: 0 auto; padding: 24px; }
+    a { color: #60a5fa; }
+    h1 { color: #fff; font-size: 1.5rem; }
+    h1 span { color: #e63946; }
+    h2 { color: #fff; font-size: 1.1rem; margin-top: 28px; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    ol, ul { padding-left: 1.2rem; }
+    li { margin-bottom: 8px; }
+    .back { display: inline-block; margin-bottom: 20px; color: #e63946; font-weight: 600; text-decoration: none; }
+    .back:hover { text-decoration: underline; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; margin: 12px 0; }
+    th, td { border: 1px solid #333; padding: 8px 10px; text-align: left; }
+    th { background: #1a1a2e; }
+    .highlight { background: #1a2e1a; border: 1px solid #16a34a; border-radius: 8px; padding: 14px 16px; margin: 16px 0; }
+    strong { color: #fff; }
+  </style>
+</head>
+<body>
+  <a class="back" href="/">← Back to Card Manager</a>
+  <h1>Holo Vault <span>Usage</span></h1>
+
+  <div class="highlight">
+    <strong>Fast path:</strong> Search → cards auto-tick → green <strong>Import selected</strong> → wait. No need to click each Add button.
+  </div>
+
+  <h2>Add many cards</h2>
+  <ol>
+    <li>Search a <strong>set name</strong> or card (e.g. <code>surging sparks</code>).</li>
+    <li>New cards are <strong>checked</strong> automatically.</li>
+    <li>Set <strong>Default ×</strong> (1.0 = market price in NZD).</li>
+    <li>Click <strong>Import selected (N)</strong> and keep the tab open (~3 sec/card).</li>
+  </ol>
+
+  <h2>Multiple searches (queue)</h2>
+  <ol>
+    <li>Search set A → tick cards → <strong>Add selected to queue</strong>.</li>
+    <li>Search set B → tick more → <strong>Add selected to queue</strong> again.</li>
+    <li>Bottom bar → <strong>Import queue to Shopify</strong>.</li>
+  </ol>
+
+  <h2>Buttons</h2>
+  <table>
+    <tr><th>Button</th><th>Use</th></tr>
+    <tr><td>Import selected</td><td>Import all checked cards</td></tr>
+    <tr><td>All new only</td><td>Skip already on store</td></tr>
+    <tr><td>Add to queue</td><td>Save for multi-search import</td></tr>
+    <tr><td>Sync Prices Now</td><td>Update all prices from Collectr</td></tr>
+  </table>
+
+  <h2>Foil vs Normal</h2>
+  <p>Same name, different finish = <strong>two products</strong>. Pick the row with the correct purple finish tag.</p>
+
+  <h2>Multiplier</h2>
+  <table>
+    <tr><th>×</th><th>Meaning</th></tr>
+    <tr><td>1.0</td><td>Collectr price → NZD</td></tr>
+    <tr><td>0.9</td><td>90% of market</td></tr>
+    <tr><td>1.1</td><td>110% of market</td></tr>
+  </table>
+
+  <h2>Troubleshooting</h2>
+  <ul>
+    <li><strong>Rate limit</strong> — wait 30s; don’t sync during import.</li>
+    <li><strong>All new (0)</strong> — everything already listed.</li>
+    <li><strong>Auth error</strong> — check Shopify client ID/secret in Railway or .env.</li>
+  </ul>
+
+  <p><a href="/">Open Card Manager</a></p>
+</body>
+</html>

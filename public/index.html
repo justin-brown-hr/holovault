@@ -44,6 +44,16 @@
     .sync-btn:disabled { background: #555; cursor: not-allowed; }
 
     .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .help-link {
+      color: #93c5fd;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+      padding: 8px 12px;
+      border: 1px solid #334155;
+      border-radius: 6px;
+    }
+    .help-link:hover { background: #1e293b; color: #fff; }
     .delete-all-btn {
       background: transparent;
       color: #f87171;
@@ -478,6 +488,7 @@
 <header>
   <h1>Holo Vault <span>Card Manager</span></h1>
   <div class="header-actions">
+    <a href="/usage.html" class="help-link" title="How to use Card Manager">? Usage</a>
     <button class="sync-btn" id="sync-btn" onclick="triggerSync()">⟳ Sync Prices Now</button>
     <button class="delete-all-btn" id="delete-all-header-btn" type="button" onclick="deleteAllProducts()">Delete all</button>
   </div>
