@@ -6,6 +6,13 @@
 require('dotenv').config();
 
 const axios = require('axios');
+const {
+  getAccessToken,
+  hasShopifyCredentials,
+  getAuthMode,
+  getAuthStatus,
+  clearTokenCache,
+} = require('./shopify-auth');
 
 const CORE_COLLECTION_HANDLES = new Set([
   'pokemon',
@@ -18,28 +25,73 @@ const CORE_COLLECTION_HANDLES = new Set([
 ]);
 
 let cachedLocationId = null;
+let inventoryApiAvailable = null;
 
-function getShopifyConfig() {
-  const store = process.env.SHOPIFY_STORE || '';
-  const accessToken = process.env.SHOPIFY_TOKEN || '';
-  const apiVersion = process.env.SHOPIFY_API_VERSION || '2024-04';
-  console.log(`[Shopify] Store: ${store}, Token: ${accessToken ? accessToken.substring(0, 10) + '...' : 'MISSING'}`);
-  return { store, accessToken, apiVersion };
+const STOCK_SCOPE_HINT =
+  'Enable Shopify Admin API scopes: read_locations, read_inventory, write_inventory (Dev Dashboard → app → Versions → scopes), then reinstall on the store.';
+
+function formatShopifyError(err) {
+  const status = err.response?.status;
+  const data = err.response?.data;
+  if (status === 403) {
+    return `Shopify permission denied (403). ${STOCK_SCOPE_HINT}`;
+  }
+  if (status === 401) {
+    return 'Shopify unauthorized (401). Check SHOPIFY_CLIENT_ID/SECRET or SHOPIFY_TOKEN in .env / Railway.';
+  }
+  if (data?.errors) {
+    return typeof data.errors === 'string' ? data.errors : JSON.stringify(data.errors);
+  }
+  return err.message || 'Shopify request failed';
 }
 
-function getClient() {
-  const { store, accessToken, apiVersion } = getShopifyConfig();
-  const BASE = `https://${store}/admin/api/${apiVersion}`;
-  return {
-    client: axios.create({
-      baseURL: BASE,
-      headers: {
-        'X-Shopify-Access-Token': accessToken,
-        'Content-Type': 'application/json',
-      },
-    }),
-    BASE,
-  };
+async function checkInventoryApiAccess() {
+  if (inventoryApiAvailable !== null) return inventoryApiAvailable;
+  try {
+    const { client } = await getClient();
+    await client.get('/locations.json');
+    inventoryApiAvailable = true;
+  } catch (err) {
+    inventoryApiAvailable = false;
+    if (err.response?.status === 403) {
+      console.warn(`[Shopify] Inventory API 403 — ${STOCK_SCOPE_HINT}`);
+    }
+  }
+  return inventoryApiAvailable;
+}
+
+async function getClient() {
+  const store = process.env.SHOPIFY_STORE || '';
+  const accessToken = await getAccessToken();
+  const apiVersion = process.env.SHOPIFY_API_VERSION || '2024-04';
+  const host = store.includes('.myshopify.com') ? store : `${store.replace(/\.myshopify\.com$/i, '')}.myshopify.com`;
+  const BASE = `https://${host}/admin/api/${apiVersion}`;
+  const client = axios.create({
+    baseURL: BASE,
+    headers: {
+      'X-Shopify-Access-Token': accessToken,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (getAuthMode() === 'client_credentials') {
+    client.interceptors.response.use(
+      (r) => r,
+      async (err) => {
+        const config = err.config;
+        if (!config || config._shopifyTokenRetry || err.response?.status !== 401) {
+          throw err;
+        }
+        clearTokenCache();
+        const freshToken = await getAccessToken();
+        config._shopifyTokenRetry = true;
+        config.headers['X-Shopify-Access-Token'] = freshToken;
+        return client.request(config);
+      }
+    );
+  }
+
+  return { client, BASE };
 }
 
 function slugifyTag(text) {
@@ -50,8 +102,9 @@ function slugifyTag(text) {
 }
 
 async function getPrimaryLocationId() {
+  if (!(await checkInventoryApiAccess())) return null;
   if (cachedLocationId) return cachedLocationId;
-  const { client } = getClient();
+  const { client } = await getClient();
   const res = await client.get('/locations.json');
   const location = res.data.locations?.find((l) => l.active) || res.data.locations?.[0];
   if (!location) throw new Error('No Shopify location found for inventory');
@@ -74,7 +127,7 @@ async function getUsdToNzdRate() {
 }
 
 async function getInventoryQuantity(inventoryItemId) {
-  const { client } = getClient();
+  const { client } = await getClient();
   const locationId = await getPrimaryLocationId();
   const res = await client.get('/inventory_levels.json', {
     params: { inventory_item_ids: inventoryItemId, location_ids: locationId },
@@ -84,8 +137,9 @@ async function getInventoryQuantity(inventoryItemId) {
 }
 
 async function setInventoryQuantity(inventoryItemId, quantity) {
-  const { client } = getClient();
   const locationId = await getPrimaryLocationId();
+  if (!locationId) return null;
+  const { client } = await getClient();
   await client.post('/inventory_levels/set.json', {
     inventory_level: {
       location_id: locationId,
@@ -96,8 +150,28 @@ async function setInventoryQuantity(inventoryItemId, quantity) {
   return Math.max(0, quantity);
 }
 
+async function getStockMetafield(productId) {
+  const { client } = await getClient();
+  const res = await client.get(`/products/${productId}/metafields.json`).catch(() => ({ data: { metafields: [] } }));
+  const mf = res.data.metafields?.find((m) => m.namespace === 'custom' && m.key === 'stock_qty');
+  return mf ? parseInt(mf.value, 10) || 0 : 0;
+}
+
+async function setStockMetafield(productId, quantity) {
+  const { client } = await getClient();
+  await client.post(`/products/${productId}/metafields.json`, {
+    metafield: {
+      namespace: 'custom',
+      key: 'stock_qty',
+      value: String(Math.max(0, quantity)),
+      type: 'number_integer',
+    },
+  }).catch(() => {});
+  return Math.max(0, quantity);
+}
+
 async function enableInventoryTracking(variantId) {
-  const { client } = getClient();
+  const { client } = await getClient();
   await client.put(`/variants/${variantId}.json`, {
     variant: {
       id: variantId,
@@ -116,7 +190,7 @@ async function ensureSetSmartCollection(setName) {
   const handle = tag;
   if (CORE_COLLECTION_HANDLES.has(handle)) return null;
 
-  const { client } = getClient();
+  const { client } = await getClient();
   const existingRes = await client.get('/smart_collections.json', {
     params: { handle, limit: 1 },
   });
@@ -145,7 +219,7 @@ async function ensureSetSmartCollection(setName) {
 }
 
 async function setProductMetafields(productId, card, multiplier) {
-  const { client } = getClient();
+  const { client } = await getClient();
 
   const metafields = [
     { namespace: 'custom', key: 'market_price', value: String(card.price || 0), type: 'number_decimal' },
@@ -166,9 +240,11 @@ async function setProductMetafields(productId, card, multiplier) {
 }
 
 async function createProduct(card, multiplier = 1.0) {
-  const { client } = getClient();
+  const { client } = await getClient();
   const rate = await getUsdToNzdRate();
   const finalPrice = (card.price * multiplier * rate).toFixed(2);
+  const useInventory = await checkInventoryApiAccess();
+  let warning = null;
 
   const body = {
     product: {
@@ -180,9 +256,9 @@ async function createProduct(card, multiplier = 1.0) {
       variants: [
         {
           price: finalPrice,
-          inventory_management: 'shopify',
+          inventory_management: useInventory ? 'shopify' : null,
           fulfillment_service: 'manual',
-          inventory_policy: 'deny',
+          inventory_policy: useInventory ? 'deny' : 'continue',
         },
       ],
       images: card.imageUrl ? [{ src: card.imageUrl }] : [],
@@ -193,14 +269,22 @@ async function createProduct(card, multiplier = 1.0) {
   const product = res.data.product;
   const variant = product.variants[0];
 
-  if (variant?.inventory_item_id) {
+  let quantity = 1;
+  if (useInventory && variant?.inventory_item_id) {
     await setInventoryQuantity(variant.inventory_item_id, 1);
+  } else {
+    warning = STOCK_SCOPE_HINT;
+    await setStockMetafield(product.id, 1);
   }
 
   await setProductMetafields(product.id, card, multiplier);
-  await ensureSetSmartCollection(card.setName);
+  try {
+    await ensureSetSmartCollection(card.setName);
+  } catch (err) {
+    console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+  }
 
-  return { product, quantity: 1, incremented: false };
+  return { product, quantity, incremented: false, warning };
 }
 
 async function findProductByCollectrId(collectrId) {
@@ -213,23 +297,34 @@ async function findProductByCollectrId(collectrId) {
  * Add stock to an existing listing (same Collectr product_id).
  */
 async function incrementProductStock(existing, card, multiplier = 1.0) {
-  const { client } = getClient();
-  let inventoryItemId = existing.inventoryItemId;
+  const { client } = await getClient();
+  const useInventory = await checkInventoryApiAccess();
+  let newQty;
+  let warning = null;
 
-  if (!inventoryItemId) {
-    const res = await client.get(`/products/${existing.productId}.json`);
-    const variant = res.data.product?.variants?.[0];
-    inventoryItemId = variant?.inventory_item_id;
-    if (variant?.id) await enableInventoryTracking(variant.id);
-  } else if (existing.inventoryManagement !== 'shopify') {
-    await enableInventoryTracking(existing.variantId);
+  if (useInventory) {
+    let inventoryItemId = existing.inventoryItemId;
+
+    if (!inventoryItemId) {
+      const res = await client.get(`/products/${existing.productId}.json`);
+      const variant = res.data.product?.variants?.[0];
+      inventoryItemId = variant?.inventory_item_id;
+      if (variant?.id) await enableInventoryTracking(variant.id);
+    } else if (existing.inventoryManagement !== 'shopify') {
+      await enableInventoryTracking(existing.variantId);
+    }
+
+    if (!inventoryItemId) throw new Error('Could not resolve inventory for existing product');
+
+    const currentQty = await getInventoryQuantity(inventoryItemId);
+    newQty = currentQty + 1;
+    await setInventoryQuantity(inventoryItemId, newQty);
+  } else {
+    const currentQty = await getStockMetafield(existing.productId);
+    newQty = currentQty + 1;
+    await setStockMetafield(existing.productId, newQty);
+    warning = STOCK_SCOPE_HINT;
   }
-
-  if (!inventoryItemId) throw new Error('Could not resolve inventory for existing product');
-
-  const currentQty = await getInventoryQuantity(inventoryItemId);
-  const newQty = currentQty + 1;
-  await setInventoryQuantity(inventoryItemId, newQty);
 
   const finalPrice = await updateProductPrice(
     existing.productId,
@@ -238,7 +333,11 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
     multiplier
   );
 
-  await ensureSetSmartCollection(card.setName);
+  try {
+    await ensureSetSmartCollection(card.setName);
+  } catch (err) {
+    console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+  }
 
   const res = await client.get(`/products/${existing.productId}.json`);
   return {
@@ -246,6 +345,7 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
     quantity: newQty,
     incremented: true,
     price: finalPrice,
+    warning,
   };
 }
 
@@ -260,14 +360,15 @@ async function addOrUpdateProduct(card, multiplier = 1.0) {
   const existing = await findProductByCollectrId(card.collectrId);
   if (existing) {
     console.log(`[Shopify] Duplicate collectr_id ${card.collectrId} → qty +1 on ${existing.title}`);
-    return incrementProductStock(existing, card, multiplier);
+    const result = await incrementProductStock(existing, card, multiplier);
+    return result;
   }
 
   return createProduct(card, multiplier);
 }
 
 async function updateProductPrice(productId, variantId, card, multiplier = 1.0) {
-  const { client } = getClient();
+  const { client } = await getClient();
   const rate = await getUsdToNzdRate();
   const finalPrice = (card.price * multiplier * rate).toFixed(2);
 
@@ -284,7 +385,7 @@ async function updateProductPrice(productId, variantId, card, multiplier = 1.0) 
 }
 
 async function getManagedProducts() {
-  const { client, BASE } = getClient();
+  const { client, BASE } = await getClient();
   const products = [];
   let url = '/products.json?limit=250&fields=id,title,variants,tags';
 
@@ -317,12 +418,18 @@ async function getManagedProducts() {
     const variant = product.variants[0];
 
     let inventoryQuantity = variant?.inventory_quantity ?? null;
-    if (variant?.inventory_item_id && variant.inventory_management === 'shopify') {
+    if (variant?.inventory_item_id && variant.inventory_management === 'shopify' && inventoryApiAvailable !== false) {
       try {
-        inventoryQuantity = await getInventoryQuantity(variant.inventory_item_id);
+        if (await checkInventoryApiAccess()) {
+          inventoryQuantity = await getInventoryQuantity(variant.inventory_item_id);
+        }
       } catch {
         inventoryQuantity = variant.inventory_quantity;
       }
+    }
+    if (inventoryQuantity == null || (inventoryApiAvailable === false && variant?.inventory_management !== 'shopify')) {
+      const metaQty = await getStockMetafield(product.id);
+      if (metaQty > 0) inventoryQuantity = metaQty;
     }
 
     result.push({
@@ -343,7 +450,7 @@ async function getManagedProducts() {
 }
 
 async function setMultiplier(productId, multiplier) {
-  const { client } = getClient();
+  const { client } = await getClient();
   await client.post(`/products/${productId}/metafields.json`, {
     metafield: {
       namespace: 'custom',
@@ -391,7 +498,7 @@ function buildTags(card) {
 }
 
 async function deleteProduct(productId) {
-  const { client } = getClient();
+  const { client } = await getClient();
   await client.delete(`/products/${productId}.json`);
 }
 
@@ -435,4 +542,11 @@ module.exports = {
   deleteAllManagedProducts,
   ensureSetSmartCollection,
   slugifyTag,
+  formatShopifyError,
+  checkInventoryApiAccess,
+  STOCK_SCOPE_HINT,
+  hasShopifyCredentials,
+  getAuthMode,
+  getAuthStatus,
+  ensureAccessToken: getAccessToken,
 };

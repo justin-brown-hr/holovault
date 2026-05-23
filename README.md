@@ -10,16 +10,21 @@ Deployed on **Railway** from this repo (`justin-brown-hr/holovault`). See `.env.
 
 ## Setup (One Time)
 
-### 1. Get Your Shopify Admin API Token
+### 1. Shopify credentials (auto-refresh)
 
-1. Go to https://admin.shopify.com/store/holo-vault-3/settings/apps
-2. Click **Develop apps** → **Create an app**
-3. Name it `Price Sync`
-4. Click **Configure Admin API scopes** and enable:
-   - `write_products`
-   - `read_products`
-5. Click **Install app** → copy the **Admin API access token**
-6. Copy `app/.env.example` to `app/.env` and set `SHOPIFY_TOKEN=shpat_…`
+Use your **Dev Dashboard** app (e.g. Pricecheck) on `holo-vault-3`:
+
+1. **Versions** → enable scopes: `read_products`, `write_products`, `read_locations`, `read_inventory`, `write_inventory`
+2. Install the app on the store
+3. Copy **Client ID** and **Client secret** from the app settings
+4. Copy `.env.example` to `.env` and set:
+   - `SHOPIFY_STORE=holo-vault-3.myshopify.com`
+   - `SHOPIFY_CLIENT_ID=…`
+   - `SHOPIFY_CLIENT_SECRET=…`
+
+The server fetches a new access token automatically (~24h lifetime) — you do **not** need to paste a new `shpat_` daily.
+
+Optional: set `SHOPIFY_TOKEN` instead if you prefer a static token (manual refresh when it expires).
 
 ### 2. Install Dependencies
 

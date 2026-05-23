@@ -38,7 +38,8 @@ If the repo does not appear:
 | Variable | Example |
 |----------|---------|
 | `SHOPIFY_STORE` | `holo-vault-3.myshopify.com` |
-| `SHOPIFY_TOKEN` | `shpat_…` |
+| `SHOPIFY_CLIENT_ID` | Dev Dashboard app client id |
+| `SHOPIFY_CLIENT_SECRET` | Dev Dashboard client secret (token auto-refreshes) |
 | `SHOPIFY_API_VERSION` | `2024-04` |
 | `DEFAULT_MULTIPLIER` | `1.0` |
 | `CRON_SCHEDULE` | `0 6 * * *` |

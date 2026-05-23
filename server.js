@@ -16,6 +16,11 @@ const {
   setMultiplier,
   deleteProduct,
   deleteAllManagedProducts,
+  formatShopifyError,
+  hasShopifyCredentials,
+  getAuthMode,
+  getAuthStatus,
+  ensureAccessToken,
 } = require('./shopify');
 const { syncAllPrices } = require('./sync-prices');
 
@@ -23,7 +28,7 @@ function getConfig() {
   return {
     shopify: {
       store: process.env.SHOPIFY_STORE || '',
-      accessToken: process.env.SHOPIFY_TOKEN || '',
+      authMode: getAuthMode(),
       apiVersion: process.env.SHOPIFY_API_VERSION || '2024-04',
     },
     sync: {
@@ -40,18 +45,37 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ── Middleware ────────────────────────────────────────────────────────────────
 
 function requireToken(req, res, next) {
-  const { shopify } = getConfig();
-  if (!shopify.accessToken) {
-    return res.status(401).json({ error: 'SHOPIFY_TOKEN env var not set.' });
+  if (!hasShopifyCredentials()) {
+    return res.status(401).json({
+      error:
+        'Shopify credentials missing. Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (auto-refresh), or SHOPIFY_TOKEN.',
+    });
   }
   next();
 }
 
 // ── API Routes ────────────────────────────────────────────────────────────────
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
   const { shopify } = getConfig();
-  res.json({ connected: !!shopify.accessToken, store: shopify.store });
+  const connected = hasShopifyCredentials();
+  let auth = getAuthStatus();
+  if (connected) {
+    try {
+      await ensureAccessToken();
+      auth = getAuthStatus();
+    } catch (err) {
+      return res.status(500).json({ connected: false, store: shopify.store, error: err.message });
+    }
+  }
+  res.json({
+    connected,
+    store: shopify.store,
+    authMode: shopify.authMode,
+    scopes: auth.scopes,
+    tokenExpiresAt: auth.expiresAt,
+    tokenExpiresInHours: auth.expiresInHours,
+  });
 });
 
 app.get('/api/search', async (req, res) => {
@@ -87,6 +111,7 @@ app.post('/api/add-card', requireToken, async (req, res) => {
       success: true,
       incremented: result.incremented,
       quantity: result.quantity,
+      warning: result.warning || null,
       product: {
         id: product.id,
         title: product.title,
@@ -97,7 +122,7 @@ app.post('/api/add-card', requireToken, async (req, res) => {
     });
   } catch (err) {
     console.error('Add card error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: formatShopifyError(err) });
   }
 });
 
@@ -182,15 +207,30 @@ cron.schedule(sync.cronSchedule, async () => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   const { shopify, sync: s } = getConfig();
   console.log(`\nHolo Vault Price Sync running at http://localhost:${PORT}`);
   console.log(`Shopify store: ${shopify.store}`);
-  if (!shopify.accessToken) {
-    console.log('⚠️  SHOPIFY_TOKEN not set. Add it to your .env file or Railway Variables.');
+  if (!hasShopifyCredentials()) {
+    console.log(
+      '⚠️  Shopify credentials missing. Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (or SHOPIFY_TOKEN) in .env / Railway.'
+    );
   } else {
-    console.log('✓ Shopify token found — ready to go.');
-    console.log(`Daily sync scheduled: ${s.cronSchedule}`);
+    try {
+      await ensureAccessToken();
+      const auth = getAuthStatus();
+      if (auth.mode === 'client_credentials') {
+        console.log(`✓ Shopify auth: client credentials (auto-refresh), scopes: ${auth.scopes || '—'}`);
+        if (auth.expiresInHours != null) {
+          console.log(`  Token valid ~${auth.expiresInHours}h (refreshes automatically before expiry)`);
+        }
+      } else {
+        console.log('✓ Shopify auth: static SHOPIFY_TOKEN');
+      }
+      console.log(`Daily sync scheduled: ${s.cronSchedule}`);
+    } catch (err) {
+      console.log('⚠️  Shopify auth failed:', err.message);
+    }
   }
 });
 

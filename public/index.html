@@ -493,6 +493,7 @@
         btn.classList.add('added');
         showToast(`"${card.name}" added at $${data.product.price} (qty 1)`, 'success');
       }
+      if (data.warning) showToast(data.warning, 'error');
       loadProducts();
       if (searchResults.length) renderSearchResults(searchResults);
     } catch (err) {

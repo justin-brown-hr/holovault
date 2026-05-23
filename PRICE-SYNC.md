@@ -19,7 +19,7 @@ Check in order:
 |-------|-----|
 | App running? | Railway service **holovault** must be deployed and **Running** |
 | `SHOPIFY_STORE` | Must be `holo-vault-3.myshopify.com` (not an old store from chat.md) |
-| `SHOPIFY_TOKEN` | Valid Admin API token with `read_products`, `write_products` |
+| Shopify auth | `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET` (auto-refresh), or `SHOPIFY_TOKEN` with `read_products`, `write_products`, `read_locations`, `read_inventory`, `write_inventory` |
 | Product tag | Only products tagged **`collectr-managed`** sync |
 | `collectr_id` metafield | Old products added before fix may lack id — **re-add from search** or run sync after re-saving |
 | Collectr HTML | If all syncs fail with “Could not fetch price”, Collectr may have changed their site — check Railway logs |
