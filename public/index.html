@@ -43,6 +43,21 @@
     .sync-btn:hover { background: #c1121f; }
     .sync-btn:disabled { background: #555; cursor: not-allowed; }
 
+    .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .delete-all-btn {
+      background: transparent;
+      color: #f87171;
+      border: 1px solid #7f1d1d;
+      padding: 8px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 600;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    .delete-all-btn:hover { background: #450a0a; border-color: #f87171; }
+    .delete-all-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
     /* ── Split Layout ── */
     .split {
       display: grid;
@@ -65,12 +80,33 @@
       padding: 16px;
       border-bottom: 1px solid #222;
       display: flex;
-      align-items: center;
-      justify-content: space-between;
+      flex-direction: column;
+      gap: 10px;
       flex-shrink: 0;
     }
 
+    .left-panel-header__row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+    }
+
     .left-panel-header h2 { font-size: 0.95rem; color: #fff; }
+
+    .delete-all-panel-btn {
+      width: 100%;
+      background: #2a0a0a;
+      color: #fca5a5;
+      border: 1px solid #7f1d1d;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+    .delete-all-panel-btn:hover { background: #450a0a; }
+    .delete-all-panel-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
     .left-panel-header span {
       background: #1d3557;
@@ -103,8 +139,14 @@
       font-size: 0.85rem;
       font-weight: 600;
       color: #fff;
-      margin-bottom: 8px;
+      margin-bottom: 4px;
       line-height: 1.3;
+    }
+    .product-card .p-qty {
+      font-size: 0.72rem;
+      color: #86efac;
+      font-weight: 700;
+      margin-bottom: 8px;
     }
 
     .product-card .p-meta {
@@ -273,6 +315,13 @@
     .add-card-btn:hover { background: #457b9d; }
     .add-card-btn:disabled { background: #333; border-color: #444; cursor: not-allowed; }
     .add-card-btn.added { background: #166534; border-color: #4ade80; }
+    .add-card-btn.already { background: #1e3a5f; border-color: #60a5fa; }
+    .card-already {
+      font-size: 0.68rem;
+      color: #93c5fd;
+      margin-bottom: 6px;
+      font-weight: 700;
+    }
 
     /* ── Toast ── */
     #toast {
@@ -314,7 +363,10 @@
 
 <header>
   <h1>Holo Vault <span>Card Manager</span></h1>
-  <button class="sync-btn" id="sync-btn" onclick="triggerSync()">⟳ Sync Prices Now</button>
+  <div class="header-actions">
+    <button class="sync-btn" id="sync-btn" onclick="triggerSync()">⟳ Sync Prices Now</button>
+    <button class="delete-all-btn" id="delete-all-header-btn" type="button" onclick="deleteAllProducts()">Delete all</button>
+  </div>
 </header>
 
 <div class="split">
@@ -322,8 +374,11 @@
   <!-- LEFT — Managed Products -->
   <div class="left-panel">
     <div class="left-panel-header">
-      <h2>Managed Products</h2>
-      <span id="product-count">0</span>
+      <div class="left-panel-header__row">
+        <h2>Managed Products</h2>
+        <span id="product-count">0</span>
+      </div>
+      <button class="delete-all-panel-btn" id="delete-all-panel-btn" type="button" onclick="deleteAllProducts()">Delete all managed products</button>
     </div>
     <div id="products-list"><div class="loading">Loading...</div></div>
   </div>
@@ -351,6 +406,7 @@
 
 <script>
   let searchResults = [];
+  let managedByCollectrId = {};
 
   // ── Search ─────────────────────────────────────────────────────────────────
   async function doSearch() {
@@ -387,12 +443,20 @@
       const changeClass = card.priceChangePct >= 0 ? 'up' : 'down';
       const changeSign = card.priceChangePct >= 0 ? '+' : '';
       const imgSrc = card.imageUrl || 'https://placehold.co/160x213?text=No+Image';
+      const existing = card.collectrId ? managedByCollectrId[String(card.collectrId)] : null;
+      const qtyLabel = existing && existing.inventoryQuantity != null ? existing.inventoryQuantity : '?';
+      const alreadyHtml = existing
+        ? `<div class="card-already">Already on store — qty ${qtyLabel}. Click to add +1.</div>`
+        : '';
+      const btnLabel = existing ? '+ Add another (qty +1)' : '+ Add to Shopify';
+      const btnClass = existing ? 'add-card-btn already' : 'add-card-btn';
       return `
         <div class="card-item">
           <img src="${escHtml(imgSrc)}" alt="${escHtml(card.name)}" loading="lazy" onerror="this.src='https://placehold.co/160x213?text=No+Image'" />
           <div class="card-info">
             <div class="card-name">${escHtml(card.name)}</div>
             ${card.subType ? `<div class="card-finish">${escHtml(card.subType)}</div>` : ''}
+            ${alreadyHtml}
             <div class="card-set">${escHtml(card.setName || '')}${card.cardNumber ? ' #' + escHtml(card.cardNumber) : ''}</div>
             <div class="card-price">$${card.price.toFixed(2)}</div>
             <div class="card-change ${changeClass}">${changeSign}${card.priceChangePct.toFixed(2)}%</div>
@@ -400,7 +464,7 @@
               <label>×</label>
               <input type="number" id="mult-${i}" value="1.00" min="0.01" max="10" step="0.05" />
             </div>
-            <button class="add-card-btn" id="add-btn-${i}" onclick="addCard(${i})">+ Add to Shopify</button>
+            <button class="${btnClass}" id="add-btn-${i}" onclick="addCard(${i})">${btnLabel}</button>
           </div>
         </div>`;
     }).join('');
@@ -420,10 +484,17 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to add card');
-      btn.textContent = '✓ Added';
-      btn.classList.add('added');
-      showToast(`"${card.name}" added at $${data.product.price}`, 'success');
+      if (data.incremented) {
+        btn.textContent = `✓ Qty ${data.quantity}`;
+        btn.classList.add('added', 'already');
+        showToast(`Already listed — stock is now ${data.quantity} at $${data.product.price}`, 'success');
+      } else {
+        btn.textContent = '✓ Added';
+        btn.classList.add('added');
+        showToast(`"${card.name}" added at $${data.product.price} (qty 1)`, 'success');
+      }
       loadProducts();
+      if (searchResults.length) renderSearchResults(searchResults);
     } catch (err) {
       btn.disabled = false;
       btn.textContent = '+ Add to Shopify';
@@ -439,6 +510,10 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to load');
       const products = data.products || [];
+      managedByCollectrId = {};
+      products.forEach((p) => {
+        if (p.collectrId) managedByCollectrId[String(p.collectrId)] = p;
+      });
       document.getElementById('product-count').textContent = products.length;
       if (products.length === 0) {
         container.innerHTML = '<div class="empty-state">No managed products yet.<br>Add cards from the search panel.</div>';
@@ -447,6 +522,7 @@
       container.innerHTML = products.map((p) => `
         <div class="product-card" id="pcard-${p.productId}">
           <div class="p-title">${escHtml(p.title)}</div>
+          <div class="p-qty">Stock: ${p.inventoryQuantity != null ? p.inventoryQuantity : '—'}</div>
           <div class="p-meta">
             <span class="p-mult-label">×</span>
             <input class="p-mult-input" type="number" id="pmult-${p.productId}" value="${p.multiplier}" min="0.01" max="10" step="0.05" />
@@ -456,6 +532,46 @@
         </div>`).join('');
     } catch (err) {
       container.innerHTML = `<div class="empty-state">Error: ${escHtml(err.message)}</div>`;
+    }
+  }
+
+  async function deleteAllProducts() {
+    const count = parseInt(document.getElementById('product-count').textContent, 10) || 0;
+    if (count === 0) return showToast('No managed products to delete.', 'error');
+
+    if (!confirm(`Delete ALL ${count} collectr-managed products from Shopify?\n\nThis cannot be undone.`)) return;
+    if (!confirm('Last chance: permanently delete every managed product?')) return;
+
+    const headerBtn = document.getElementById('delete-all-header-btn');
+    const panelBtn = document.getElementById('delete-all-panel-btn');
+    headerBtn.disabled = true;
+    panelBtn.disabled = true;
+    panelBtn.textContent = 'Deleting...';
+
+    try {
+      const res = await fetch('/api/products/delete-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'DELETE ALL' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Delete all failed');
+
+      const msg = data.failed
+        ? `Deleted ${data.deleted} of ${data.total}. ${data.failed} failed.`
+        : `Deleted all ${data.deleted} products.`;
+      showToast(msg, data.failed ? 'error' : 'success');
+      if (data.errors?.length) console.warn('Delete errors:', data.errors);
+
+      managedByCollectrId = {};
+      loadProducts();
+      if (searchResults.length) renderSearchResults(searchResults);
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      headerBtn.disabled = false;
+      panelBtn.disabled = false;
+      panelBtn.textContent = 'Delete all managed products';
     }
   }
 

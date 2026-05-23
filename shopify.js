@@ -7,6 +7,18 @@ require('dotenv').config();
 
 const axios = require('axios');
 
+const CORE_COLLECTION_HANDLES = new Set([
+  'pokemon',
+  'english',
+  'japanese',
+  'chinese',
+  'singles',
+  'frontpage',
+  'all',
+]);
+
+let cachedLocationId = null;
+
 function getShopifyConfig() {
   const store = process.env.SHOPIFY_STORE || '';
   const accessToken = process.env.SHOPIFY_TOKEN || '';
@@ -30,10 +42,23 @@ function getClient() {
   };
 }
 
-/**
- * Get live USD to NZD exchange rate.
- * Falls back to a hardcoded rate if the API fails.
- */
+function slugifyTag(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+async function getPrimaryLocationId() {
+  if (cachedLocationId) return cachedLocationId;
+  const { client } = getClient();
+  const res = await client.get('/locations.json');
+  const location = res.data.locations?.find((l) => l.active) || res.data.locations?.[0];
+  if (!location) throw new Error('No Shopify location found for inventory');
+  cachedLocationId = location.id;
+  return cachedLocationId;
+}
+
 async function getUsdToNzdRate() {
   try {
     const res = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 5000 });
@@ -45,13 +70,101 @@ async function getUsdToNzdRate() {
   } catch (err) {
     console.warn('[Currency] Could not fetch live rate, using fallback:', err.message);
   }
-  // Fallback rate — update this occasionally if not using live rate
   return 1.65;
 }
 
+async function getInventoryQuantity(inventoryItemId) {
+  const { client } = getClient();
+  const locationId = await getPrimaryLocationId();
+  const res = await client.get('/inventory_levels.json', {
+    params: { inventory_item_ids: inventoryItemId, location_ids: locationId },
+  });
+  const level = res.data.inventory_levels?.[0];
+  return level ? level.available : 0;
+}
+
+async function setInventoryQuantity(inventoryItemId, quantity) {
+  const { client } = getClient();
+  const locationId = await getPrimaryLocationId();
+  await client.post('/inventory_levels/set.json', {
+    inventory_level: {
+      location_id: locationId,
+      inventory_item_id: inventoryItemId,
+      available: Math.max(0, quantity),
+    },
+  });
+  return Math.max(0, quantity);
+}
+
+async function enableInventoryTracking(variantId) {
+  const { client } = getClient();
+  await client.put(`/variants/${variantId}.json`, {
+    variant: {
+      id: variantId,
+      inventory_management: 'shopify',
+      inventory_policy: 'deny',
+    },
+  });
+}
+
 /**
- * Create a new product in Shopify from Collectr card data.
+ * Create smart collection for a TCG set (subcategory) if missing.
  */
+async function ensureSetSmartCollection(setName) {
+  if (!setName || !setName.trim()) return null;
+  const tag = slugifyTag(setName);
+  const handle = tag;
+  if (CORE_COLLECTION_HANDLES.has(handle)) return null;
+
+  const { client } = getClient();
+  const existingRes = await client.get('/smart_collections.json', {
+    params: { handle, limit: 1 },
+  });
+  const existing = existingRes.data.smart_collections?.[0];
+
+  const payload = {
+    smart_collection: {
+      title: setName.trim(),
+      handle,
+      body_html: `<p>Pokémon TCG singles from ${setName.trim()}.</p>`,
+      published: true,
+      disjunctive: false,
+      rules: [{ column: 'tag', relation: 'equals', condition: tag }],
+    },
+  };
+
+  if (existing) {
+    await client.put(`/smart_collections/${existing.id}.json`, payload);
+    console.log(`[Shopify] Set collection updated: ${setName} (/collections/${handle})`);
+    return existing.id;
+  }
+
+  const res = await client.post('/smart_collections.json', payload);
+  console.log(`[Shopify] Set collection created: ${setName} (/collections/${handle})`);
+  return res.data.smart_collection.id;
+}
+
+async function setProductMetafields(productId, card, multiplier) {
+  const { client } = getClient();
+
+  const metafields = [
+    { namespace: 'custom', key: 'market_price', value: String(card.price || 0), type: 'number_decimal' },
+    { namespace: 'custom', key: 'market_price_nzd', value: String((card.price || 0) * multiplier), type: 'number_decimal' },
+    { namespace: 'custom', key: 'price_change', value: String(card.priceChange || 0), type: 'number_decimal' },
+    { namespace: 'custom', key: 'price_change_pct', value: String(card.priceChangePct || 0), type: 'number_decimal' },
+    { namespace: 'custom', key: 'multiplier', value: multiplier.toString(), type: 'number_decimal' },
+    { namespace: 'custom', key: 'collectr_id', value: card.collectrId ? card.collectrId.toString() : '', type: 'single_line_text_field' },
+    { namespace: 'custom', key: 'collectr_url', value: card.collectrUrl || '', type: 'single_line_text_field' },
+    { namespace: 'custom', key: 'card_sub_type', value: card.subType || '', type: 'single_line_text_field' },
+    { namespace: 'custom', key: 'set_name', value: card.setName || '', type: 'single_line_text_field' },
+    { namespace: 'custom', key: 'last_synced', value: new Date().toISOString(), type: 'single_line_text_field' },
+  ];
+
+  for (const mf of metafields) {
+    await client.post(`/products/${productId}/metafields.json`, { metafield: mf }).catch(() => {});
+  }
+}
+
 async function createProduct(card, multiplier = 1.0) {
   const { client } = getClient();
   const rate = await getUsdToNzdRate();
@@ -67,9 +180,9 @@ async function createProduct(card, multiplier = 1.0) {
       variants: [
         {
           price: finalPrice,
-          inventory_management: null,
+          inventory_management: 'shopify',
           fulfillment_service: 'manual',
-          inventory_policy: 'continue',
+          inventory_policy: 'deny',
         },
       ],
       images: card.imageUrl ? [{ src: card.imageUrl }] : [],
@@ -78,15 +191,81 @@ async function createProduct(card, multiplier = 1.0) {
 
   const res = await client.post('/products.json', body);
   const product = res.data.product;
+  const variant = product.variants[0];
+
+  if (variant?.inventory_item_id) {
+    await setInventoryQuantity(variant.inventory_item_id, 1);
+  }
 
   await setProductMetafields(product.id, card, multiplier);
+  await ensureSetSmartCollection(card.setName);
 
-  return product;
+  return { product, quantity: 1, incremented: false };
+}
+
+async function findProductByCollectrId(collectrId) {
+  if (!collectrId) return null;
+  const products = await getManagedProducts();
+  return products.find((p) => String(p.collectrId) === String(collectrId)) || null;
 }
 
 /**
- * Update the price of an existing Shopify product.
+ * Add stock to an existing listing (same Collectr product_id).
  */
+async function incrementProductStock(existing, card, multiplier = 1.0) {
+  const { client } = getClient();
+  let inventoryItemId = existing.inventoryItemId;
+
+  if (!inventoryItemId) {
+    const res = await client.get(`/products/${existing.productId}.json`);
+    const variant = res.data.product?.variants?.[0];
+    inventoryItemId = variant?.inventory_item_id;
+    if (variant?.id) await enableInventoryTracking(variant.id);
+  } else if (existing.inventoryManagement !== 'shopify') {
+    await enableInventoryTracking(existing.variantId);
+  }
+
+  if (!inventoryItemId) throw new Error('Could not resolve inventory for existing product');
+
+  const currentQty = await getInventoryQuantity(inventoryItemId);
+  const newQty = currentQty + 1;
+  await setInventoryQuantity(inventoryItemId, newQty);
+
+  const finalPrice = await updateProductPrice(
+    existing.productId,
+    existing.variantId,
+    card,
+    multiplier
+  );
+
+  await ensureSetSmartCollection(card.setName);
+
+  const res = await client.get(`/products/${existing.productId}.json`);
+  return {
+    product: res.data.product,
+    quantity: newQty,
+    incremented: true,
+    price: finalPrice,
+  };
+}
+
+/**
+ * Add new listing or bump quantity if same Collectr card already exists.
+ */
+async function addOrUpdateProduct(card, multiplier = 1.0) {
+  if (!card.collectrId) {
+    throw new Error('Collectr product id missing — cannot deduplicate listings');
+  }
+
+  const existing = await findProductByCollectrId(card.collectrId);
+  if (existing) {
+    console.log(`[Shopify] Duplicate collectr_id ${card.collectrId} → qty +1 on ${existing.title}`);
+    return incrementProductStock(existing, card, multiplier);
+  }
+
+  return createProduct(card, multiplier);
+}
+
 async function updateProductPrice(productId, variantId, card, multiplier = 1.0) {
   const { client } = getClient();
   const rate = await getUsdToNzdRate();
@@ -104,32 +283,6 @@ async function updateProductPrice(productId, variantId, card, multiplier = 1.0) 
   return finalPrice;
 }
 
-/**
- * Store Collectr price data as product metafields.
- */
-async function setProductMetafields(productId, card, multiplier) {
-  const { client } = getClient();
-
-  const metafields = [
-    { namespace: 'custom', key: 'market_price', value: card.price.toString(), type: 'number_decimal' },
-    { namespace: 'custom', key: 'market_price_nzd', value: (card.price * multiplier).toString(), type: 'number_decimal' },
-    { namespace: 'custom', key: 'price_change', value: card.priceChange.toString(), type: 'number_decimal' },
-    { namespace: 'custom', key: 'price_change_pct', value: card.priceChangePct.toString(), type: 'number_decimal' },
-    { namespace: 'custom', key: 'multiplier', value: multiplier.toString(), type: 'number_decimal' },
-    { namespace: 'custom', key: 'collectr_id', value: card.collectrId ? card.collectrId.toString() : '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'collectr_url', value: card.collectrUrl || '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'card_sub_type', value: card.subType || '', type: 'single_line_text_field' },
-    { namespace: 'custom', key: 'last_synced', value: new Date().toISOString(), type: 'single_line_text_field' },
-  ];
-
-  for (const mf of metafields) {
-    await client.post(`/products/${productId}/metafields.json`, { metafield: mf }).catch(() => {});
-  }
-}
-
-/**
- * Get all Collectr-managed products (identified by tag).
- */
 async function getManagedProducts() {
   const { client, BASE } = getClient();
   const products = [];
@@ -148,11 +301,12 @@ async function getManagedProducts() {
     }
   }
 
-  const managed = products.filter(p => p.tags && p.tags.includes('collectr-managed'));
+  const managed = products.filter((p) => p.tags && p.tags.includes('collectr-managed'));
 
   const result = [];
   for (const product of managed) {
-    const mfRes = await client.get(`/products/${product.id}/metafields.json`)
+    const mfRes = await client
+      .get(`/products/${product.id}/metafields.json`)
       .catch(() => ({ data: { metafields: [] } }));
     const metafields = mfRes.data.metafields;
 
@@ -160,10 +314,23 @@ async function getManagedProducts() {
     const collectrUrl = metafields.find((m) => m.key === 'collectr_url');
     const multiplier = metafields.find((m) => m.key === 'multiplier');
     const subType = metafields.find((m) => m.key === 'card_sub_type');
+    const variant = product.variants[0];
+
+    let inventoryQuantity = variant?.inventory_quantity ?? null;
+    if (variant?.inventory_item_id && variant.inventory_management === 'shopify') {
+      try {
+        inventoryQuantity = await getInventoryQuantity(variant.inventory_item_id);
+      } catch {
+        inventoryQuantity = variant.inventory_quantity;
+      }
+    }
 
     result.push({
       productId: product.id,
-      variantId: product.variants[0]?.id,
+      variantId: variant?.id,
+      inventoryItemId: variant?.inventory_item_id,
+      inventoryManagement: variant?.inventory_management,
+      inventoryQuantity,
       title: product.title,
       collectrId: collectrId?.value || null,
       collectrUrl: collectrUrl?.value || null,
@@ -175,9 +342,6 @@ async function getManagedProducts() {
   return result;
 }
 
-/**
- * Update the multiplier for a specific product.
- */
 async function setMultiplier(productId, multiplier) {
   const { client } = getClient();
   await client.post(`/products/${productId}/metafields.json`, {
@@ -189,8 +353,6 @@ async function setMultiplier(productId, multiplier) {
     },
   });
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function buildProductTitle(card) {
   const name = (card.name || '').trim();
@@ -223,17 +385,54 @@ function buildTags(card) {
     tags.push('english');
   }
 
-  if (card.setName) tags.push(card.setName.toLowerCase().replace(/\s+/g, '-'));
-  if (card.rarity) tags.push(card.rarity.toLowerCase().replace(/\s+/g, '-'));
+  if (card.setName) tags.push(slugifyTag(card.setName));
+  if (card.rarity) tags.push(slugifyTag(card.rarity));
   return tags.join(', ');
 }
 
-/**
- * Delete a product from Shopify.
- */
 async function deleteProduct(productId) {
   const { client } = getClient();
   await client.delete(`/products/${productId}.json`);
 }
 
-module.exports = { createProduct, updateProductPrice, getManagedProducts, setMultiplier, deleteProduct };
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Delete every product tagged collectr-managed (Card Manager listings).
+ */
+async function deleteAllManagedProducts() {
+  const products = await getManagedProducts();
+  const results = { deleted: 0, failed: 0, total: products.length, errors: [] };
+
+  console.log(`[Shopify] Deleting ${products.length} managed products...`);
+
+  for (const product of products) {
+    try {
+      await deleteProduct(product.productId);
+      results.deleted++;
+      console.log(`  ✓ Deleted: ${product.title}`);
+      await sleep(400);
+    } catch (err) {
+      results.failed++;
+      results.errors.push({ product: product.title, error: err.message });
+      console.error(`  ✗ ${product.title}:`, err.message);
+    }
+  }
+
+  return results;
+}
+
+module.exports = {
+  createProduct,
+  addOrUpdateProduct,
+  updateProductPrice,
+  getManagedProducts,
+  findProductByCollectrId,
+  setMultiplier,
+  deleteProduct,
+  deleteAllManagedProducts,
+  ensureSetSmartCollection,
+  slugifyTag,
+};

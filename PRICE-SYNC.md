@@ -45,6 +45,33 @@ Cron only runs while the **Node server is running** (not a separate worker unles
 2. If the Shopify product was added from the wrong search row, delete and re-add the correct listing.
 3. Click **Sync Prices Now** — confirm `1 updated` for that product in the toast.
 
+## Duplicate cards (same Collectr listing)
+
+Adding the **same Collectr `product_id` again** in Card Manager:
+
+- Does **not** create a second Shopify product
+- **Increases stock** by 1 on the existing listing
+- Refreshes price and metafields (including **% today** badge)
+
+Match key: `custom.collectr_id` (set when the card is first added).
+
+## Inventory & sold out
+
+- New and restocked cards use **tracked inventory** (`deny` when out of stock)
+- Storefront shows **1 in stock**, **2 in stock**, or **Sold out**
+- When a customer buys the last copy, Shopify shows **Sold out** (listing stays; you do not need to delete)
+
+Older products created before this update may need one **re-add +1** or a manual inventory enable in Admin.
+
+## Set subcategories (Journey Together, Gem Pack, etc.)
+
+When a card is added, the app creates a **smart collection** for that set (tag = set slug, e.g. `gem-pack`).
+
+- URL: `/collections/gem-pack`
+- Header **Sets** menu lists set collections automatically
+
+Run **Sync Prices Now** once to refresh metafields on older listings.
+
 ## Finish / variant on storefront
 
 - New products: finish saved to metafield + product description.

@@ -10,7 +10,13 @@ const express = require('express');
 const path = require('path');
 const cron = require('node-cron');
 const { searchCards, closeBrowser } = require('./collectr');
-const { createProduct, getManagedProducts, setMultiplier, deleteProduct } = require('./shopify');
+const {
+  addOrUpdateProduct,
+  getManagedProducts,
+  setMultiplier,
+  deleteProduct,
+  deleteAllManagedProducts,
+} = require('./shopify');
 const { syncAllPrices } = require('./sync-prices');
 
 function getConfig() {
@@ -74,14 +80,18 @@ app.post('/api/add-card', requireToken, async (req, res) => {
   const mult = parseFloat(multiplier) || sync.defaultMultiplier;
 
   try {
-    const product = await createProduct(card, mult);
+    const result = await addOrUpdateProduct(card, mult);
+    const product = result.product;
     const storeHandle = shopify.store.replace('.myshopify.com', '');
     res.json({
       success: true,
+      incremented: result.incremented,
+      quantity: result.quantity,
       product: {
         id: product.id,
         title: product.title,
-        price: product.variants[0]?.price,
+        price: result.price || product.variants[0]?.price,
+        quantity: result.quantity,
         shopifyUrl: `https://admin.shopify.com/store/${storeHandle}/products/${product.id}`,
       },
     });
@@ -97,6 +107,22 @@ app.get('/api/products', requireToken, async (req, res) => {
     res.json({ products });
   } catch (err) {
     console.error('Products error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/products/delete-all', requireToken, async (req, res) => {
+  if (req.body?.confirm !== 'DELETE ALL') {
+    return res.status(400).json({
+      error: 'Send { "confirm": "DELETE ALL" } to permanently remove all collectr-managed products.',
+    });
+  }
+
+  try {
+    const results = await deleteAllManagedProducts();
+    res.json({ success: true, ...results });
+  } catch (err) {
+    console.error('Delete all error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
