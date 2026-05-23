@@ -30,10 +30,17 @@ let inventoryApiAvailable = null;
 const STOCK_SCOPE_HINT =
   'Enable Shopify Admin API scopes: read_locations, read_inventory, write_inventory (Dev Dashboard → app → Versions → scopes), then reinstall on the store.';
 
+const PRODUCTS_SCOPE_HINT =
+  'Enable read_products (and write_products) on your Dev Dashboard app version, then reinstall on the store.';
+
 function formatShopifyError(err) {
   const status = err.response?.status;
   const data = err.response?.data;
   if (status === 403) {
+    const msg = typeof data?.errors === 'string' ? data.errors : JSON.stringify(data?.errors || '');
+    if (/product|smart_collection|graphql/i.test(msg)) {
+      return `Shopify permission denied (403). ${PRODUCTS_SCOPE_HINT}`;
+    }
     return `Shopify permission denied (403). ${STOCK_SCOPE_HINT}`;
   }
   if (status === 401) {
@@ -72,6 +79,7 @@ async function getClient() {
       'X-Shopify-Access-Token': accessToken,
       'Content-Type': 'application/json',
     },
+    timeout: 60000,
   });
 
   if (getAuthMode() === 'client_credentials') {
@@ -287,10 +295,85 @@ async function createProduct(card, multiplier = 1.0) {
   return { product, quantity, incremented: false, warning };
 }
 
+async function shopifyGraphql(client, query, variables = {}) {
+  const res = await client.post('/graphql.json', { query, variables });
+  if (res.data?.errors?.length) {
+    const err = new Error(res.data.errors.map((e) => e.message).join('; '));
+    err.response = { status: 403, data: { errors: res.data.errors } };
+    throw err;
+  }
+  return res.data?.data;
+}
+
+function legacyId(gidOrId) {
+  if (gidOrId == null) return null;
+  const s = String(gidOrId);
+  const m = s.match(/\/(\d+)$/);
+  return m ? m[1] : s;
+}
+
+/**
+ * Fast duplicate check (1 GraphQL request). Falls back to full scan if GraphQL unavailable.
+ */
 async function findProductByCollectrId(collectrId) {
   if (!collectrId) return null;
-  const products = await getManagedProducts();
-  return products.find((p) => String(p.collectrId) === String(collectrId)) || null;
+  try {
+    return await findProductByCollectrIdFast(collectrId);
+  } catch (err) {
+    console.warn('[Shopify] Fast collectr_id lookup failed, using full scan:', formatShopifyError(err));
+    const products = await getManagedProducts();
+    return products.find((p) => String(p.collectrId) === String(collectrId)) || null;
+  }
+}
+
+async function findProductByCollectrIdFast(collectrId) {
+  const { client } = await getClient();
+  const query = `
+    query FindCollectrProduct($query: String!) {
+      products(first: 1, query: $query) {
+        edges {
+          node {
+            legacyResourceId
+            title
+            variants(first: 1) {
+              edges {
+                node {
+                  legacyResourceId
+                  inventoryQuantity
+                  inventoryItem { legacyResourceId }
+                }
+              }
+            }
+            collectrId: metafield(namespace: "custom", key: "collectr_id") { value }
+            collectrUrl: metafield(namespace: "custom", key: "collectr_url") { value }
+            multiplier: metafield(namespace: "custom", key: "multiplier") { value }
+            subType: metafield(namespace: "custom", key: "card_sub_type") { value }
+          }
+        }
+      }
+    }
+  `;
+  const searchQuery = `tag:collectr-managed metafields.custom.collectr_id:${collectrId}`;
+  const data = await shopifyGraphql(client, query, { query: searchQuery });
+  const node = data?.products?.edges?.[0]?.node;
+  if (!node) return null;
+
+  const variant = node.variants?.edges?.[0]?.node;
+  const mfId = node.collectrId?.value;
+  if (mfId && String(mfId) !== String(collectrId)) return null;
+
+  return {
+    productId: node.legacyResourceId,
+    variantId: variant?.legacyResourceId,
+    inventoryItemId: legacyId(variant?.inventoryItem?.legacyResourceId),
+    inventoryManagement: variant?.inventoryItem ? 'shopify' : null,
+    inventoryQuantity: variant?.inventoryQuantity ?? null,
+    title: node.title,
+    collectrId: mfId || String(collectrId),
+    collectrUrl: node.collectrUrl?.value || null,
+    subType: node.subType?.value || null,
+    multiplier: node.multiplier?.value ? parseFloat(node.multiplier.value) : 1.0,
+  };
 }
 
 /**
@@ -314,11 +397,16 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
       await enableInventoryTracking(existing.variantId);
     }
 
-    if (!inventoryItemId) throw new Error('Could not resolve inventory for existing product');
-
+    if (!inventoryItemId) {
+      const currentQty = await getStockMetafield(existing.productId);
+      newQty = currentQty + 1;
+      await setStockMetafield(existing.productId, newQty);
+      warning = STOCK_SCOPE_HINT;
+    } else {
     const currentQty = await getInventoryQuantity(inventoryItemId);
     newQty = currentQty + 1;
     await setInventoryQuantity(inventoryItemId, newQty);
+    }
   } else {
     const currentQty = await getStockMetafield(existing.productId);
     newQty = currentQty + 1;

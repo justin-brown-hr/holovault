@@ -121,8 +121,13 @@ app.post('/api/add-card', requireToken, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('Add card error:', err.message);
-    res.status(500).json({ error: formatShopifyError(err) });
+    const shopifyDetail = err.response?.data;
+    console.error('Add card error:', err.message, shopifyDetail || '');
+    res.status(500).json({
+      error: formatShopifyError(err),
+      status: err.response?.status || null,
+      shopify: shopifyDetail || null,
+    });
   }
 });
 

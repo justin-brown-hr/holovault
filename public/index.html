@@ -483,7 +483,10 @@
         body: JSON.stringify({ card, multiplier }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to add card');
+      if (!res.ok) {
+        const extra = data.shopify ? ` (${typeof data.shopify === 'string' ? data.shopify : JSON.stringify(data.shopify)})` : '';
+        throw new Error((data.error || 'Failed to add card') + extra);
+      }
       if (data.incremented) {
         btn.textContent = `✓ Qty ${data.quantity}`;
         btn.classList.add('added', 'already');
