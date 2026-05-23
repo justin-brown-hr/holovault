@@ -12,6 +12,7 @@ const cron = require('node-cron');
 const { searchCards, closeBrowser } = require('./collectr');
 const {
   addOrUpdateProduct,
+  bulkAddCards,
   getManagedProductsCached,
   setMultiplier,
   deleteProduct,
@@ -128,6 +129,25 @@ app.post('/api/add-card', requireToken, async (req, res) => {
       status: err.response?.status || null,
       shopify: shopifyDetail || null,
     });
+  }
+});
+
+app.post('/api/bulk-add', requireToken, async (req, res) => {
+  const { cards, multiplier, onlyNew } = req.body;
+  const { sync } = getConfig();
+
+  if (!Array.isArray(cards) || cards.length === 0) {
+    return res.status(400).json({ error: 'Send { cards: [...] } with at least one card from search results.' });
+  }
+
+  const mult = parseFloat(multiplier) || sync.defaultMultiplier;
+
+  try {
+    const results = await bulkAddCards(cards, mult, { onlyNew: !!onlyNew });
+    res.json({ success: true, ...results });
+  } catch (err) {
+    console.error('Bulk add error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 

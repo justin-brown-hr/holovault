@@ -135,18 +135,30 @@ async function getPrimaryLocationId() {
   return cachedLocationId;
 }
 
+let cachedUsdNzd = { at: 0, rate: 1.65 };
+
 async function getUsdToNzdRate() {
+  if (Date.now() - cachedUsdNzd.at < 300000) return cachedUsdNzd.rate;
   try {
     const res = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 5000 });
     const rate = res.data?.rates?.NZD;
     if (rate) {
+      cachedUsdNzd = { at: Date.now(), rate };
       console.log(`[Currency] Live USD→NZD rate: ${rate}`);
       return rate;
     }
   } catch (err) {
     console.warn('[Currency] Could not fetch live rate, using fallback:', err.message);
   }
-  return 1.65;
+  return cachedUsdNzd.rate;
+}
+
+function buildListingIndex(products) {
+  const index = new Map();
+  for (const p of products) {
+    if (p.collectrId) index.set(listingKey(p.collectrId, p.subType), p);
+  }
+  return index;
 }
 
 /** REST inventory APIs need a numeric inventory item id (not a GID). */
@@ -327,9 +339,10 @@ async function setProductMetafields(productId, card, multiplier) {
   }
 }
 
-async function createProduct(card, multiplier = 1.0) {
+async function createProduct(card, multiplier = 1.0, options = {}) {
+  const { skipCollection = false, skipCacheInvalidate = false, usdRate = null } = options;
   const { client } = await getClient();
-  const rate = await getUsdToNzdRate();
+  const rate = usdRate ?? (await getUsdToNzdRate());
   const finalPrice = (card.price * multiplier * rate).toFixed(2);
   const useInventory = await checkInventoryApiAccess();
   let warning = null;
@@ -394,13 +407,15 @@ async function createProduct(card, multiplier = 1.0) {
     multiplier,
   });
 
-  try {
-    await ensureSetSmartCollection(card.setName);
-  } catch (err) {
-    console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+  if (!skipCollection && card.setName) {
+    try {
+      await ensureSetSmartCollection(card.setName);
+    } catch (err) {
+      console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+    }
   }
 
-  invalidateManagedProductsCache();
+  if (!skipCacheInvalidate) invalidateManagedProductsCache();
   return { product, quantity, incremented: false, warning };
 }
 
@@ -498,12 +513,15 @@ function nodeToExistingListing(node, collectrId) {
 /**
  * Find existing listing by Collectr product_id + finish (cache → GraphQL → REST).
  */
-async function findExistingListing(card) {
+async function findExistingListing(card, listingIndex = null) {
   if (!card?.collectrId) return null;
   const key = listingKey(card.collectrId, card.subType);
 
   if (collectrIdCache.has(key)) {
     return collectrIdCache.get(key);
+  }
+  if (listingIndex?.has(key)) {
+    return listingIndex.get(key);
   }
 
   let found = null;
@@ -570,7 +588,8 @@ async function findProductByCollectrId(collectrId) {
 /**
  * Add stock to an existing listing (same Collectr product_id).
  */
-async function incrementProductStock(existing, card, multiplier = 1.0) {
+async function incrementProductStock(existing, card, multiplier = 1.0, options = {}) {
+  const { skipCollection = false, skipCacheInvalidate = false, usdRate = null } = options;
   const { client } = await getClient();
   const useInventory = await checkInventoryApiAccess();
   let newQty;
@@ -616,13 +635,16 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
     existing.productId,
     existing.variantId,
     card,
-    multiplier
+    multiplier,
+    usdRate
   );
 
-  try {
-    await ensureSetSmartCollection(card.setName);
-  } catch (err) {
-    console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+  if (!skipCollection && card.setName) {
+    try {
+      await ensureSetSmartCollection(card.setName);
+    } catch (err) {
+      console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+    }
   }
 
   const res = await client.get(`/products/${existing.productId}.json`);
@@ -639,7 +661,7 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
     subType: card.subType || existing.subType,
   });
 
-  invalidateManagedProductsCache();
+  if (!skipCacheInvalidate) invalidateManagedProductsCache();
   return {
     product: updated,
     quantity: newQty,
@@ -651,27 +673,36 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
 
 /**
  * Add new listing or bump quantity if same Collectr card already exists.
+ * @param {object} options.bulk — defer collection + cache flush (use bulkAddCards)
+ * @param {Map} options.listingIndex — in-memory index from getManagedProducts
  */
-async function addOrUpdateProduct(card, multiplier = 1.0) {
+async function addOrUpdateProduct(card, multiplier = 1.0, options = {}) {
   if (!card.collectrId) {
     throw new Error('Collectr product id missing — cannot deduplicate listings');
   }
 
-  const existing = await findExistingListing(card);
+  const bulkOpts = options.bulk
+    ? {
+        skipCollection: true,
+        skipCacheInvalidate: true,
+        usdRate: options.usdRate,
+      }
+    : {};
+
+  const existing = await findExistingListing(card, options.listingIndex || null);
   if (existing) {
     console.log(
       `[Shopify] Duplicate ${card.collectrId} (${card.subType || 'default'}) → qty +1 on ${existing.title}`
     );
-    const result = await incrementProductStock(existing, card, multiplier);
-    return result;
+    return incrementProductStock(existing, card, multiplier, bulkOpts);
   }
 
-  return createProduct(card, multiplier);
+  return createProduct(card, multiplier, bulkOpts);
 }
 
-async function updateProductPrice(productId, variantId, card, multiplier = 1.0) {
+async function updateProductPrice(productId, variantId, card, multiplier = 1.0, usdRate = null) {
   const { client } = await getClient();
-  const rate = await getUsdToNzdRate();
+  const rate = usdRate ?? (await getUsdToNzdRate());
   const finalPrice = (card.price * multiplier * rate).toFixed(2);
 
   await client.put(`/variants/${variantId}.json`, {
@@ -684,6 +715,90 @@ async function updateProductPrice(productId, variantId, card, multiplier = 1.0) 
   await setProductMetafields(productId, card, multiplier);
 
   return finalPrice;
+}
+
+/**
+ * Add many cards sequentially (rate-limited). One Collectr search per card is NOT needed — pass card payloads from search.
+ */
+async function bulkAddCards(cards, defaultMultiplier = 1.0, options = {}) {
+  const { onlyNew = false } = options;
+  const maxCards = parseInt(process.env.BULK_MAX_CARDS || '100', 10);
+  if (!cards?.length) {
+    return { added: 0, incremented: 0, skipped: 0, failed: 0, total: 0, errors: [], durationMs: 0 };
+  }
+  if (cards.length > maxCards) {
+    throw new Error(`Bulk add limited to ${maxCards} cards per batch. Split into smaller batches.`);
+  }
+
+  const started = Date.now();
+  const results = { added: 0, incremented: 0, skipped: 0, failed: 0, total: cards.length, errors: [] };
+
+  const managed = await getManagedProductsCached();
+  let listingIndex = buildListingIndex(managed);
+  const usdRate = await getUsdToNzdRate();
+  await checkInventoryApiAccess();
+
+  let toProcess = cards;
+  if (onlyNew) {
+    toProcess = cards.filter((card) => {
+      if (!card.collectrId) return false;
+      const key = listingKey(card.collectrId, card.subType);
+      return !listingIndex.has(key) && !collectrIdCache.has(key);
+    });
+    results.skipped = cards.length - toProcess.length;
+  }
+
+  const setsToEnsure = new Set();
+  console.log(`[Bulk] Processing ${toProcess.length} cards (${results.skipped} skipped as already listed)...`);
+
+  for (let i = 0; i < toProcess.length; i++) {
+    const card = toProcess[i];
+    const mult = parseFloat(card._multiplier) || defaultMultiplier;
+    try {
+      const result = await addOrUpdateProduct(card, mult, {
+        bulk: true,
+        listingIndex,
+        usdRate,
+      });
+      if (card.setName) setsToEnsure.add(card.setName.trim());
+
+      const key = listingKey(card.collectrId, card.subType);
+      listingIndex.set(key, {
+        productId: result.product?.id,
+        variantId: result.product?.variants?.[0]?.id,
+        title: result.product?.title,
+        collectrId: String(card.collectrId),
+        subType: card.subType,
+        inventoryQuantity: result.quantity,
+      });
+
+      if (result.incremented) results.incremented++;
+      else results.added++;
+    } catch (err) {
+      results.failed++;
+      results.errors.push({
+        name: card.name,
+        subType: card.subType,
+        error: formatShopifyError(err),
+      });
+      console.error(`[Bulk] ${i + 1}/${toProcess.length} failed:`, card.name, err.message);
+    }
+  }
+
+  for (const setName of setsToEnsure) {
+    try {
+      await ensureSetSmartCollection(setName);
+    } catch (err) {
+      console.warn(`[Bulk] Collection skipped for ${setName}:`, formatShopifyError(err));
+    }
+  }
+
+  invalidateManagedProductsCache();
+  results.durationMs = Date.now() - started;
+  console.log(
+    `[Bulk] Done in ${(results.durationMs / 1000).toFixed(1)}s — added ${results.added}, +qty ${results.incremented}, skipped ${results.skipped}, failed ${results.failed}`
+  );
+  return results;
 }
 
 async function getManagedProductsCached() {
@@ -849,6 +964,8 @@ async function deleteAllManagedProducts() {
 module.exports = {
   createProduct,
   addOrUpdateProduct,
+  bulkAddCards,
+  buildListingIndex,
   updateProductPrice,
   getManagedProducts,
   getManagedProductsCached,

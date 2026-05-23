@@ -282,6 +282,77 @@
       border-radius: 6px;
       margin-bottom: 5px;
     }
+
+    .bulk-bar {
+      display: none;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      margin: 0 16px 12px;
+      background: #1a1a2e;
+      border: 1px solid #333;
+      border-radius: 8px;
+    }
+    .bulk-bar.visible { display: flex; }
+    .bulk-bar label { font-size: 0.8rem; color: #aaa; }
+    .bulk-bar input[type="number"] {
+      width: 64px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid #444;
+      background: #111;
+      color: #fff;
+    }
+    .bulk-btn {
+      background: #457b9d;
+      color: #fff;
+      border: none;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .bulk-btn:hover { background: #3a6a8a; }
+    .bulk-btn:disabled { background: #444; cursor: not-allowed; }
+    .bulk-btn.secondary { background: #333; border: 1px solid #555; }
+    .bulk-hint { font-size: 0.75rem; color: #888; flex: 1 1 100%; }
+
+    .bulk-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .bulk-overlay.visible { display: flex; }
+    .bulk-modal {
+      background: #1a1a2e;
+      border: 1px solid #444;
+      border-radius: 12px;
+      padding: 24px 28px;
+      max-width: 420px;
+      width: 90%;
+      text-align: center;
+    }
+    .bulk-modal h3 { color: #fff; margin-bottom: 12px; }
+    .bulk-modal p { color: #aaa; font-size: 0.9rem; margin-bottom: 16px; }
+    .bulk-progress {
+      height: 8px;
+      background: #333;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    .bulk-progress__bar {
+      height: 100%;
+      background: linear-gradient(90deg, #e63946, #457b9d);
+      width: 0%;
+      transition: width 0.3s;
+    }
     .card-price { font-size: 0.95rem; font-weight: 700; color: #4ade80; }
     .card-change { font-size: 0.7rem; margin-top: 2px; }
     .card-change.up { color: #4ade80; }
@@ -397,9 +468,25 @@
         <button id="search-btn" onclick="doSearch()">Search</button>
       </div>
     </div>
+    <div class="bulk-bar" id="bulk-bar">
+      <label>Default ×</label>
+      <input type="number" id="bulk-multiplier" value="1.00" min="0.01" max="10" step="0.05" />
+      <button type="button" class="bulk-btn" id="bulk-add-new-btn" onclick="bulkAdd(true)">Add all new</button>
+      <button type="button" class="bulk-btn secondary" id="bulk-add-all-btn" onclick="bulkAdd(false)">Add all results</button>
+      <span class="bulk-hint" id="bulk-hint">Processes on server one-by-one (~3s/card). Stay on this tab until done.</span>
+    </div>
     <div id="search-results"><div class="empty-state">Search for a card to get started.</div></div>
   </div>
 
+</div>
+
+<div class="bulk-overlay" id="bulk-overlay">
+  <div class="bulk-modal">
+    <h3>Adding cards to Shopify</h3>
+    <p id="bulk-status">Starting…</p>
+    <div class="bulk-progress"><div class="bulk-progress__bar" id="bulk-progress-bar"></div></div>
+    <p id="bulk-estimate" style="font-size:0.8rem;color:#666"></p>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -434,6 +521,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Search failed');
       searchResults = data.cards || [];
+      updateBulkBar();
       renderSearchResults(searchResults);
     } catch (err) {
       document.getElementById('search-results').innerHTML = '<div class="empty-state">Search failed. Try again.</div>';
@@ -441,6 +529,108 @@
     } finally {
       btn.disabled = false;
       btn.textContent = 'Search';
+    }
+  }
+
+  function countNewCards() {
+    return searchResults.filter((c) => {
+      if (!c.collectrId) return false;
+      return !managedByCollectrId[listingKey(c.collectrId, c.subType)];
+    }).length;
+  }
+
+  function updateBulkBar() {
+    const bar = document.getElementById('bulk-bar');
+    if (!searchResults.length) {
+      bar.classList.remove('visible');
+      return;
+    }
+    bar.classList.add('visible');
+    const newCount = countNewCards();
+    document.getElementById('bulk-add-new-btn').textContent =
+      newCount > 0 ? `Add all new (${newCount})` : 'Add all new (0)';
+    document.getElementById('bulk-add-all-btn').textContent =
+      `Add all results (${searchResults.length})`;
+    document.getElementById('bulk-hint').textContent =
+      `~${Math.ceil(searchResults.length * 3 / 60)} min for full batch at Shopify rate limits. Use "Add all new" to skip listings already on the store.`;
+  }
+
+  async function bulkAdd(onlyNew) {
+    if (!searchResults.length) return showToast('Search for cards first.', 'error');
+
+    const cards = searchResults.map((card, i) => {
+      const multEl = document.getElementById(`mult-${i}`);
+      const mult = multEl ? parseFloat(multEl.value) : parseFloat(document.getElementById('bulk-multiplier').value);
+      return { ...card, _multiplier: mult };
+    });
+
+    const count = onlyNew ? countNewCards() : cards.length;
+    if (onlyNew && count === 0) return showToast('All search results are already on the store.', 'error');
+
+    const defaultMult = parseFloat(document.getElementById('bulk-multiplier').value) || 1;
+    const msg = onlyNew
+      ? `Add ${count} new cards to Shopify? (skips ones already listed)`
+      : `Add all ${cards.length} cards? Existing listings will get +1 stock.`;
+    if (!confirm(msg)) return;
+
+    const overlay = document.getElementById('bulk-overlay');
+    const statusEl = document.getElementById('bulk-status');
+    const bar = document.getElementById('bulk-progress-bar');
+    const estimateEl = document.getElementById('bulk-estimate');
+    overlay.classList.add('visible');
+    bar.style.width = '5%';
+    statusEl.textContent = `Sending ${onlyNew ? count : cards.length} cards to server…`;
+    estimateEl.textContent = `Estimated ~${Math.ceil((onlyNew ? count : cards.length) * 3)} seconds`;
+
+    document.getElementById('bulk-add-new-btn').disabled = true;
+    document.getElementById('bulk-add-all-btn').disabled = true;
+    document.getElementById('search-btn').disabled = true;
+
+    const BATCH = 50;
+    const chunks = [];
+    for (let i = 0; i < cards.length; i += BATCH) chunks.push(cards.slice(i, i + BATCH));
+
+    const totals = { added: 0, incremented: 0, skipped: 0, failed: 0, durationMs: 0, errors: [] };
+
+    try {
+      for (let c = 0; c < chunks.length; c++) {
+        const chunk = chunks[c];
+        statusEl.textContent = `Batch ${c + 1} of ${chunks.length} (${chunk.length} cards)…`;
+        bar.style.width = `${Math.round(((c + 0.2) / chunks.length) * 100)}%`;
+
+        const res = await fetch('/api/bulk-add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cards: chunk, multiplier: defaultMult, onlyNew }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Bulk add failed');
+
+        totals.added += data.added || 0;
+        totals.incremented += data.incremented || 0;
+        totals.skipped += data.skipped || 0;
+        totals.failed += data.failed || 0;
+        totals.durationMs += data.durationMs || 0;
+        if (data.errors?.length) totals.errors.push(...data.errors);
+        bar.style.width = `${Math.round(((c + 1) / chunks.length) * 100)}%`;
+      }
+
+      const summary = `Done in ${(totals.durationMs / 1000).toFixed(0)}s — ${totals.added} new, ${totals.incremented} stock+1, ${totals.skipped} skipped, ${totals.failed} failed`;
+      statusEl.textContent = summary;
+      showToast(summary, totals.failed ? 'error' : 'success');
+      if (totals.errors.length) console.warn('Bulk errors:', totals.errors);
+      await loadProducts();
+      renderSearchResults(searchResults);
+      updateBulkBar();
+    } catch (err) {
+      statusEl.textContent = err.message;
+      showToast(err.message, 'error');
+    } finally {
+      setTimeout(() => overlay.classList.remove('visible'), 2000);
+      document.getElementById('bulk-add-new-btn').disabled = false;
+      document.getElementById('bulk-add-all-btn').disabled = false;
+      document.getElementById('search-btn').disabled = false;
+      bar.style.width = '0%';
     }
   }
 
@@ -531,6 +721,7 @@
       products.forEach((p) => {
         if (p.collectrId) managedByCollectrId[listingKey(p.collectrId, p.subType)] = p;
       });
+      updateBulkBar();
       document.getElementById('product-count').textContent = products.length;
       if (products.length === 0) {
         container.innerHTML = '<div class="empty-state">No managed products yet.<br>Add cards from the search panel.</div>';
