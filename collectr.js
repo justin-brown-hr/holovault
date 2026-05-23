@@ -41,9 +41,20 @@ function parseCollectrUrl(collectrUrl) {
 /**
  * Find one card in search results by Collectr product_id.
  */
-function findCardById(cards, productId) {
+function findCardById(cards, productId, subType = null) {
   if (!productId || !cards?.length) return null;
-  return cards.find((c) => String(c.collectrId) === String(productId)) || null;
+  const matches = cards.filter((c) => String(c.collectrId) === String(productId));
+  if (matches.length === 0) return null;
+  if (subType) {
+    const norm = (s) =>
+      (s || '')
+        .trim()
+        .toLowerCase()
+        .replace(/_/g, ' ');
+    const subMatch = matches.find((c) => norm(c.subType) === norm(subType));
+    if (subMatch) return subMatch;
+  }
+  return matches.length === 1 ? matches[0] : null;
 }
 
 /**
@@ -68,9 +79,9 @@ async function resolveCardForSync({ collectrId, collectrUrl, title, subType }) {
     seen.add(q);
     const cards = await searchCards(q);
     if (targetId) {
-      const match = findCardById(cards, targetId);
+      const match = findCardById(cards, targetId, subType);
       if (match) {
-        console.log(`[Collectr] Matched id ${targetId} via query "${q}"`);
+        console.log(`[Collectr] Matched id ${targetId} (${subType || 'any'}) via query "${q}"`);
         return match;
       }
     }

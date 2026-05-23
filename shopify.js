@@ -336,7 +336,7 @@ async function createProduct(card, multiplier = 1.0) {
   const inventoryItemId = normalizeInventoryItemId(variant?.inventory_item_id)
     || (await resolveInventoryItemId(client, product.id, variant.id));
 
-  cacheCollectrListing(card.collectrId, {
+  cacheCollectrListing(card, {
     productId: product.id,
     variantId: variant.id,
     inventoryItemId,
@@ -375,8 +375,27 @@ function legacyId(gidOrId) {
   return m ? m[1] : s;
 }
 
-function cacheCollectrListing(collectrId, listing) {
-  if (collectrId && listing) collectrIdCache.set(String(collectrId), listing);
+/** Collectr uses one product_id per finish; Foil and Normal share an id but differ by subType. */
+function normalizeSubType(subType) {
+  return (subType || '')
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+function listingKey(collectrId, subType) {
+  return `${String(collectrId)}::${normalizeSubType(subType)}`;
+}
+
+function subTypesMatch(a, b) {
+  return normalizeSubType(a) === normalizeSubType(b);
+}
+
+function cacheCollectrListing(card, listing) {
+  if (card?.collectrId && listing) {
+    collectrIdCache.set(listingKey(card.collectrId, card.subType), listing);
+  }
 }
 
 function buildExistingListing(product, metafields) {
@@ -400,10 +419,10 @@ function buildExistingListing(product, metafields) {
   };
 }
 
-/** REST scan by collectr_id metafield (immediate; does not wait for Shopify search index). */
-async function findProductByCollectrIdRest(collectrId) {
+/** REST scan by collectr_id + finish/subType (immediate; does not wait for Shopify search index). */
+async function findExistingListingRest(card) {
   const { client, BASE } = await getClient();
-  const target = String(collectrId);
+  const targetId = String(card.collectrId);
   let url = '/products.json?limit=250&fields=id,title,variants,tags';
 
   while (url) {
@@ -413,10 +432,14 @@ async function findProductByCollectrIdRest(collectrId) {
       const mfRes = await client
         .get(`/products/${product.id}/metafields.json`)
         .catch(() => ({ data: { metafields: [] } }));
-      const mf = mfRes.data.metafields?.find(
-        (m) => m.namespace === 'custom' && m.key === 'collectr_id' && String(m.value) === target
+      const metafields = mfRes.data.metafields || [];
+      const idMf = metafields.find(
+        (m) => m.namespace === 'custom' && m.key === 'collectr_id' && String(m.value) === targetId
       );
-      if (mf) return buildExistingListing(product, mfRes.data.metafields);
+      const subMf = metafields.find((m) => m.namespace === 'custom' && m.key === 'card_sub_type');
+      if (idMf && subTypesMatch(subMf?.value, card.subType)) {
+        return buildExistingListing(product, metafields);
+      }
     }
 
     const linkHeader = res.headers.link;
@@ -430,12 +453,31 @@ async function findProductByCollectrIdRest(collectrId) {
   return null;
 }
 
+function nodeToExistingListing(node, collectrId) {
+  const variant = node.variants?.edges?.[0]?.node;
+  const mfId = node.collectrId?.value;
+  if (!mfId || String(mfId) !== String(collectrId)) return null;
+
+  return {
+    productId: node.legacyResourceId,
+    variantId: variant?.legacyResourceId,
+    inventoryItemId: legacyId(variant?.inventoryItem?.id),
+    inventoryManagement: variant?.inventoryItem ? 'shopify' : null,
+    inventoryQuantity: variant?.inventoryQuantity ?? null,
+    title: node.title,
+    collectrId: mfId,
+    collectrUrl: node.collectrUrl?.value || null,
+    subType: node.subType?.value || null,
+    multiplier: node.multiplier?.value ? parseFloat(node.multiplier.value) : 1.0,
+  };
+}
+
 /**
- * Find existing listing by Collectr product_id (cache → GraphQL → REST metafield scan).
+ * Find existing listing by Collectr product_id + finish (cache → GraphQL → REST).
  */
-async function findProductByCollectrId(collectrId) {
-  if (!collectrId) return null;
-  const key = String(collectrId);
+async function findExistingListing(card) {
+  if (!card?.collectrId) return null;
+  const key = listingKey(card.collectrId, card.subType);
 
   if (collectrIdCache.has(key)) {
     return collectrIdCache.get(key);
@@ -443,24 +485,24 @@ async function findProductByCollectrId(collectrId) {
 
   let found = null;
   try {
-    found = await findProductByCollectrIdFast(collectrId);
+    found = await findExistingListingGraphql(card);
   } catch (err) {
-    console.warn('[Shopify] GraphQL collectr_id lookup failed:', formatShopifyError(err));
+    console.warn('[Shopify] GraphQL listing lookup failed:', formatShopifyError(err));
   }
 
   if (!found) {
-    found = await findProductByCollectrIdRest(collectrId);
+    found = await findExistingListingRest(card);
   }
 
-  if (found) cacheCollectrListing(key, found);
+  if (found) cacheCollectrListing(card, found);
   return found;
 }
 
-async function findProductByCollectrIdFast(collectrId) {
+async function findExistingListingGraphql(card) {
   const { client } = await getClient();
   const query = `
     query FindCollectrProduct($query: String!) {
-      products(first: 1, query: $query) {
+      products(first: 25, query: $query) {
         edges {
           node {
             legacyResourceId
@@ -483,27 +525,23 @@ async function findProductByCollectrIdFast(collectrId) {
       }
     }
   `;
-  const searchQuery = `tag:collectr-managed metafields.custom.collectr_id:${collectrId}`;
+  const searchQuery = `tag:collectr-managed metafields.custom.collectr_id:${card.collectrId}`;
   const data = await shopifyGraphql(client, query, { query: searchQuery });
-  const node = data?.products?.edges?.[0]?.node;
-  if (!node) return null;
+  const edges = data?.products?.edges || [];
 
-  const variant = node.variants?.edges?.[0]?.node;
-  const mfId = node.collectrId?.value;
-  if (!mfId || String(mfId) !== String(collectrId)) return null;
+  for (const edge of edges) {
+    const node = edge?.node;
+    if (!node) continue;
+    if (!subTypesMatch(node.subType?.value, card.subType)) continue;
+    const listing = nodeToExistingListing(node, card.collectrId);
+    if (listing) return listing;
+  }
+  return null;
+}
 
-  return {
-    productId: node.legacyResourceId,
-    variantId: variant?.legacyResourceId,
-    inventoryItemId: legacyId(variant?.inventoryItem?.id),
-    inventoryManagement: variant?.inventoryItem ? 'shopify' : null,
-    inventoryQuantity: variant?.inventoryQuantity ?? null,
-    title: node.title,
-    collectrId: mfId || String(collectrId),
-    collectrUrl: node.collectrUrl?.value || null,
-    subType: node.subType?.value || null,
-    multiplier: node.multiplier?.value ? parseFloat(node.multiplier.value) : 1.0,
-  };
+/** @deprecated Use findExistingListing(card) — id alone is not unique across Foil/Normal. */
+async function findProductByCollectrId(collectrId) {
+  return findExistingListing({ collectrId, subType: '' });
 }
 
 /**
@@ -567,7 +605,7 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
   const res = await client.get(`/products/${existing.productId}.json`);
   const updated = res.data.product;
   const variant = updated.variants?.[0];
-  cacheCollectrListing(card.collectrId, {
+  cacheCollectrListing(card, {
     ...existing,
     productId: updated.id,
     variantId: variant?.id,
@@ -575,6 +613,7 @@ async function incrementProductStock(existing, card, multiplier = 1.0) {
       normalizeInventoryItemId(variant?.inventory_item_id) || existing.inventoryItemId,
     inventoryQuantity: newQty,
     title: updated.title,
+    subType: card.subType || existing.subType,
   });
 
   return {
@@ -594,9 +633,11 @@ async function addOrUpdateProduct(card, multiplier = 1.0) {
     throw new Error('Collectr product id missing — cannot deduplicate listings');
   }
 
-  const existing = await findProductByCollectrId(card.collectrId);
+  const existing = await findExistingListing(card);
   if (existing) {
-    console.log(`[Shopify] Duplicate collectr_id ${card.collectrId} → qty +1 on ${existing.title}`);
+    console.log(
+      `[Shopify] Duplicate ${card.collectrId} (${card.subType || 'default'}) → qty +1 on ${existing.title}`
+    );
     const result = await incrementProductStock(existing, card, multiplier);
     return result;
   }
@@ -773,7 +814,10 @@ module.exports = {
   addOrUpdateProduct,
   updateProductPrice,
   getManagedProducts,
+  findExistingListing,
   findProductByCollectrId,
+  listingKey,
+  normalizeSubType,
   setMultiplier,
   deleteProduct,
   deleteAllManagedProducts,

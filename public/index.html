@@ -408,6 +408,11 @@
   let searchResults = [];
   let managedByCollectrId = {};
 
+  function listingKey(collectrId, subType) {
+    const sub = (subType || '').trim().toLowerCase().replace(/_/g, ' ');
+    return `${String(collectrId)}::${sub}`;
+  }
+
   // ── Search ─────────────────────────────────────────────────────────────────
   async function doSearch() {
     const q = document.getElementById('search-input').value.trim();
@@ -443,7 +448,9 @@
       const changeClass = card.priceChangePct >= 0 ? 'up' : 'down';
       const changeSign = card.priceChangePct >= 0 ? '+' : '';
       const imgSrc = card.imageUrl || 'https://placehold.co/160x213?text=No+Image';
-      const existing = card.collectrId ? managedByCollectrId[String(card.collectrId)] : null;
+      const existing = card.collectrId
+        ? managedByCollectrId[listingKey(card.collectrId, card.subType)]
+        : null;
       const qtyLabel = existing && existing.inventoryQuantity != null ? existing.inventoryQuantity : '?';
       const alreadyHtml = existing
         ? `<div class="card-already">Already on store — qty ${qtyLabel}. Click to add +1.</div>`
@@ -516,7 +523,7 @@
       const products = data.products || [];
       managedByCollectrId = {};
       products.forEach((p) => {
-        if (p.collectrId) managedByCollectrId[String(p.collectrId)] = p;
+        if (p.collectrId) managedByCollectrId[listingKey(p.collectrId, p.subType)] = p;
       });
       document.getElementById('product-count').textContent = products.length;
       if (products.length === 0) {
