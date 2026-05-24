@@ -14,6 +14,7 @@ const {
   addOrUpdateProduct,
   bulkAddCards,
   getManagedProductsCached,
+  invalidateManagedProductsCache,
   setMultiplier,
   deleteProduct,
   deleteAllManagedProducts,
@@ -23,7 +24,7 @@ const {
   getAuthStatus,
   ensureAccessToken,
 } = require('./shopify');
-const { syncAllPrices } = require('./sync-prices');
+const { syncAllPrices, syncProductById } = require('./sync-prices');
 
 function getConfig() {
   return {
@@ -202,6 +203,24 @@ app.patch('/api/products/:id/multiplier', requireToken, async (req, res) => {
   }
 });
 
+app.post('/api/products/:id/sync', requireToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    invalidateManagedProductsCache();
+    const { newPrice, freshCard, product } = await syncProductById(id);
+    res.json({
+      success: true,
+      price: newPrice,
+      marketPrice: freshCard.price,
+      cardNumber: product.cardNumber,
+      subType: product.subType,
+    });
+  } catch (err) {
+    console.error('Sync one error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function writeSse(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
@@ -257,9 +276,11 @@ cron.schedule(sync.cronSchedule, async () => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
+  invalidateManagedProductsCache();
   const { shopify, sync: s } = getConfig();
   console.log(`\nHolo Vault Price Sync running at http://localhost:${PORT}`);
   console.log(`Shopify store: ${shopify.store}`);
+  console.log('Sync: reads card # / finish from metafields or product description (v2)');
   if (!hasShopifyCredentials()) {
     console.log(
       '⚠️  Shopify credentials missing. Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (or SHOPIFY_TOKEN) in .env / Railway.'

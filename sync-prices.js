@@ -8,7 +8,62 @@
  */
 
 const { resolveCardForSync, closeBrowser } = require('./collectr');
-const { getManagedProducts, updateProductPrice } = require('./shopify');
+const { getManagedProducts, updateProductPrice, ensureProductCardFields } = require('./shopify');
+
+async function syncOneProduct(product, emit) {
+  const log = (payload) => {
+    if (typeof emit === 'function') emit(payload);
+  };
+
+  product = await ensureProductCardFields(product);
+
+  if (!product.cardNumber) {
+    throw new Error(
+      'Missing card number — add "Number: 125/159" in the product description or re-add from Collectr'
+    );
+  }
+  if (!product.subType) {
+    throw new Error(
+      'Missing finish — add "Finish: Normal" in the description, include " — Normal" in the title, or re-add from Collectr'
+    );
+  }
+
+  log({
+    type: 'progress',
+    title: product.title,
+    phase: 'collectr',
+    detail: `Finding #${product.cardNumber} · ${product.subType}`,
+  });
+
+  const freshCard = await resolveCardForSync({
+    collectrId: product.collectrId,
+    collectrUrl: product.collectrUrl,
+    title: product.title,
+    subType: product.subType,
+    cardNumber: product.cardNumber,
+  });
+
+  if (!freshCard || freshCard.price === 0) {
+    throw new Error(
+      `No Collectr price for #${product.cardNumber} · ${product.subType} — check number and finish match Collectr`
+    );
+  }
+
+  log({ type: 'progress', title: product.title, phase: 'shopify' });
+
+  const newPrice = await updateProductPrice(
+    product.productId,
+    product.variantId,
+    freshCard,
+    product.multiplier
+  );
+
+  console.log(
+    `  ✓ ${product.title}: $${newPrice} (#${product.cardNumber} ${product.subType}, market $${freshCard.price})`
+  );
+
+  return { newPrice, freshCard };
+}
 
 async function syncAllPrices(onProgress) {
   const emit = (payload) => {
@@ -30,7 +85,7 @@ async function syncAllPrices(onProgress) {
 
   if (products.length === 0) {
     console.log('No managed products found. Add cards via the admin UI first.');
-    emit({ type: 'done', success: 0, failed: 0, errors: [], total: 0 });
+    emit({ type: 'done', total: 0, updated: 0, failed: 0, errors: [] });
     return { success: 0, failed: 0, errors: [] };
   }
 
@@ -48,44 +103,18 @@ async function syncAllPrices(onProgress) {
       total,
       title: product.title,
       phase: 'collectr',
+      detail: product.cardNumber
+        ? `#${product.cardNumber} · ${product.subType || '?'}`
+        : 'missing card number',
       updated: results.success,
       failed: results.failed,
     });
 
     try {
-      console.log(`Syncing: ${product.title}`);
+      console.log(`Syncing: ${product.title} (#${product.cardNumber || '?'} · ${product.subType || '?'})`);
 
-      const freshCard = await resolveCardForSync({
-        collectrId: product.collectrId,
-        collectrUrl: product.collectrUrl,
-        title: product.title,
-        subType: product.subType,
-      });
+      const { newPrice } = await syncOneProduct(product, emit);
 
-      if (!freshCard || freshCard.price === 0) {
-        throw new Error(
-          'Could not fetch price from Collectr (wrong variant or missing collectr_id — re-add card from search)'
-        );
-      }
-
-      emit({
-        type: 'progress',
-        current,
-        total,
-        title: product.title,
-        phase: 'shopify',
-        updated: results.success,
-        failed: results.failed,
-      });
-
-      const newPrice = await updateProductPrice(
-        product.productId,
-        product.variantId,
-        freshCard,
-        product.multiplier
-      );
-
-      console.log(`  ✓ ${product.title}: $${newPrice} (market: $${freshCard.price}, multiplier: ${product.multiplier}x)`);
       results.success++;
 
       emit({
@@ -130,11 +159,19 @@ async function syncAllPrices(onProgress) {
   return results;
 }
 
+async function syncProductById(productId) {
+  const products = await getManagedProducts();
+  const product = products.find((p) => String(p.productId) === String(productId));
+  if (!product) throw new Error('Managed product not found');
+  const { newPrice, freshCard } = await syncOneProduct(product);
+  await closeBrowser();
+  return { product, newPrice, freshCard };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Run directly if called as a script
 if (require.main === module) {
   syncAllPrices()
     .then(() => process.exit(0))
@@ -144,4 +181,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { syncAllPrices };
+module.exports = { syncAllPrices, syncOneProduct, syncProductById };

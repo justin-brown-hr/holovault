@@ -7,6 +7,7 @@
  */
 
 const axios = require('axios');
+const { normalizeSubType, pickMatchingCard } = require('./collectr-match');
 
 const COLLECTR_BASE = 'https://app.getcollectr.com';
 
@@ -58,51 +59,69 @@ function findCardById(cards, productId, subType = null) {
 }
 
 /**
- * Resolve the correct Collectr listing (variant) for sync.
- * Never returns searchResults[0] unless it matches the stored product id.
+ * Resolve the correct Collectr listing for price sync.
+ * Step 1: find by card number (e.g. 058/159)
+ * Step 2: narrow by finish (e.g. Normal)
+ * Never returns a loose / first search hit.
  */
-async function resolveCardForSync({ collectrId, collectrUrl, title, subType }) {
+async function resolveCardForSync({ collectrId, collectrUrl, title, subType, cardNumber }) {
   const { productId: urlProductId, groupSlug } = parseCollectrUrl(collectrUrl);
-  const targetId = collectrId || urlProductId;
+  const criteria = {
+    collectrId: collectrId || urlProductId,
+    subType,
+    cardNumber,
+  };
 
+  const tryPool = (cards, source) => {
+    const match = pickMatchingCard(cards, criteria);
+    if (match) {
+      console.log(
+        `[Collectr] Matched #${match.cardNumber || '?'} / ${match.subType || '?'} ($${match.price}) via ${source}`
+      );
+      return match;
+    }
+    return null;
+  };
+
+  if (collectrUrl) {
+    const fromUrl = await fetchCardsFromUrl(collectrUrl);
+    const hit = tryPool(fromUrl, 'collectr_url');
+    if (hit) return hit;
+  }
+
+  const baseTitle = title?.replace(/\s*—\s*[^—]+$/, '').trim() || '';
   const queries = [];
-  if (title) queries.push(title);
+  if (cardNumber && baseTitle) queries.push(`${baseTitle} ${cardNumber}`);
+  if (cardNumber) queries.push(String(cardNumber).replace(/^#/, ''));
+  if (baseTitle) queries.push(baseTitle);
+  if (title && title !== baseTitle) queries.push(title);
   if (groupSlug) queries.push(groupSlug.replace(/-/g, ' '));
-
-  // Strip trailing " — Holofoil" style suffix for broader search
-  const baseTitle = title?.replace(/\s*—\s*[^—]+$/, '').trim();
-  if (baseTitle && baseTitle !== title) queries.push(baseTitle);
 
   const seen = new Set();
   for (const q of queries) {
     if (!q || seen.has(q)) continue;
     seen.add(q);
     const cards = await searchCards(q);
-    if (targetId) {
-      const match = findCardById(cards, targetId, subType);
-      if (match) {
-        console.log(`[Collectr] Matched id ${targetId} (${subType || 'any'}) via query "${q}"`);
-        return match;
-      }
-    }
-    // Single unambiguous result
-    if (cards.length === 1) {
-      console.log(`[Collectr] Single result for "${q}"`);
-      return cards[0];
-    }
-    // Multiple results: match finish/subtype if we have it stored
-    if (subType && cards.length > 1) {
-      const subMatch = cards.find(
-        (c) => c.subType && c.subType.toLowerCase() === subType.toLowerCase()
-      );
-      if (subMatch) {
-        console.log(`[Collectr] Matched subType "${subType}" via query "${q}"`);
-        return subMatch;
-      }
-    }
+    const hit = tryPool(cards, `search "${q}"`);
+    if (hit) return hit;
   }
 
+  console.warn(
+    `[Collectr] No match for #${cardNumber || '?'} finish="${subType || '?'}" id=${criteria.collectrId || '?'}`
+  );
   return null;
+}
+
+async function fetchCardsFromUrl(collectrUrl) {
+  if (!collectrUrl || !collectrUrl.includes('getcollectr.com')) return [];
+  try {
+    console.log(`[Collectr] Fetching set page: ${collectrUrl}`);
+    const res = await axios.get(collectrUrl, { headers: HEADERS, timeout: 15000 });
+    return extractCardsFromHtml(res.data);
+  } catch (err) {
+    console.warn('[Collectr] Set page fetch failed:', err.message);
+    return [];
+  }
 }
 
 /**

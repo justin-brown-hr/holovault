@@ -321,6 +321,7 @@ async function setProductMetafields(productId, card, multiplier) {
     },
     { namespace: 'custom', key: 'collectr_url', type: 'single_line_text_field', value: card.collectrUrl || '' },
     { namespace: 'custom', key: 'card_sub_type', type: 'single_line_text_field', value: finish },
+    { namespace: 'custom', key: 'card_number', type: 'single_line_text_field', value: card.cardNumber || '' },
     { namespace: 'custom', key: 'set_name', type: 'single_line_text_field', value: card.setName || '' },
     { namespace: 'custom', key: 'last_synced', type: 'single_line_text_field', value: new Date().toISOString() },
   ].map((mf) => ({ ...mf, ownerId }));
@@ -810,6 +811,107 @@ async function getManagedProductsCached() {
   return data;
 }
 
+/**
+ * Parse card # and finish from product description (legacy listings before metafields).
+ */
+function parseCardFieldsFromDescription(descriptionHtml) {
+  if (!descriptionHtml) return { cardNumber: null, subType: null };
+  const strip = (s) => s.replace(/<[^>]+>/g, '').trim();
+
+  const numMatch =
+    descriptionHtml.match(/<strong>Number:<\/strong>\s*([^<]+)/i) ||
+    descriptionHtml.match(/Number:\s*([0-9]+\s*\/\s*[0-9]+)/i);
+  const finishMatch =
+    descriptionHtml.match(/<strong>Finish:<\/strong>\s*([^<]+)/i) ||
+    descriptionHtml.match(/Finish:\s*([^<\n]+)/i);
+
+  return {
+    cardNumber: numMatch ? strip(numMatch[1]) : null,
+    subType: finishMatch ? strip(finishMatch[1]) : null,
+  };
+}
+
+function parseFinishFromTitle(title) {
+  if (!title) return null;
+  const m = title.match(/\s+—\s+([^—]+)$/);
+  return m ? m[1].trim() : null;
+}
+
+function enrichManagedProductFields({ title, descriptionHtml, cardNumberMeta, subTypeMeta }) {
+  const fromDesc = parseCardFieldsFromDescription(descriptionHtml);
+  const fromTitle = parseFinishFromTitle(title);
+  const cardNumber = cardNumberMeta || fromDesc.cardNumber || null;
+  const subType = subTypeMeta || fromDesc.subType || fromTitle || null;
+
+  return {
+    cardNumber,
+    subType,
+    cardNumberMetaMissing: !cardNumberMeta && !!cardNumber,
+    subTypeMetaMissing: !subTypeMeta && !!subType,
+    needsMetafieldBackfill:
+      (!cardNumberMeta && !!cardNumber) || (!subTypeMeta && !!subType),
+  };
+}
+
+async function backfillCardMetafields(product) {
+  if (!product.needsMetafieldBackfill) return;
+
+  const { client } = await getClient();
+  const ownerId = `gid://shopify/Product/${product.productId}`;
+  const metafields = [];
+
+  if (product.cardNumberMetaMissing && product.cardNumber) {
+    metafields.push({
+      namespace: 'custom',
+      key: 'card_number',
+      type: 'single_line_text_field',
+      value: product.cardNumber,
+      ownerId,
+    });
+  }
+  if (product.subTypeMetaMissing && product.subType) {
+    metafields.push({
+      namespace: 'custom',
+      key: 'card_sub_type',
+      type: 'single_line_text_field',
+      value: formatSubTypeForStore(product.subType),
+      ownerId,
+    });
+  }
+
+  if (!metafields.length) return;
+
+  const mutation = `
+    mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphql(client, mutation, { metafields });
+  const errors = data?.metafieldsSet?.userErrors;
+  if (errors?.length) {
+    console.warn(
+      `[Shopify] card metafield backfill ${product.productId}:`,
+      errors.map((e) => e.message).join('; ')
+    );
+  } else {
+    console.log(`[Shopify] Backfilled card_number/finish metafields for product ${product.productId}`);
+    invalidateManagedProductsCache();
+  }
+}
+
+/** Ensure card # and finish (from description/title if needed) and save metafields for legacy products. */
+async function ensureProductCardFields(product) {
+  if (product.needsMetafieldBackfill) {
+    await backfillCardMetafields(product);
+    product.needsMetafieldBackfill = false;
+    product.cardNumberMetaMissing = false;
+    product.subTypeMetaMissing = false;
+  }
+  return product;
+}
+
 async function getManagedProducts() {
   const { client } = await getClient();
   const query = `
@@ -820,10 +922,13 @@ async function getManagedProducts() {
           node {
             legacyResourceId
             title
+            descriptionHtml
+            featuredImage { url }
             variants(first: 1) {
               edges {
                 node {
                   legacyResourceId
+                  price
                   inventoryQuantity
                   inventoryItem { id }
                 }
@@ -833,6 +938,7 @@ async function getManagedProducts() {
             collectrUrl: metafield(namespace: "custom", key: "collectr_url") { value }
             multiplier: metafield(namespace: "custom", key: "multiplier") { value }
             subType: metafield(namespace: "custom", key: "card_sub_type") { value }
+            cardNumber: metafield(namespace: "custom", key: "card_number") { value }
             stockQty: metafield(namespace: "custom", key: "stock_qty") { value }
           }
         }
@@ -857,6 +963,15 @@ async function getManagedProducts() {
         inventoryQuantity = metaQty;
       }
 
+      const cardNumberMeta = node.cardNumber?.value?.trim() || '';
+      const subTypeMeta = node.subType?.value?.trim() || '';
+      const enriched = enrichManagedProductFields({
+        title: node.title,
+        descriptionHtml: node.descriptionHtml,
+        cardNumberMeta,
+        subTypeMeta,
+      });
+
       result.push({
         productId: node.legacyResourceId,
         variantId: variant?.legacyResourceId,
@@ -864,9 +979,15 @@ async function getManagedProducts() {
         inventoryManagement: variant?.inventoryItem?.id ? 'shopify' : null,
         inventoryQuantity,
         title: node.title,
+        imageUrl: node.featuredImage?.url || null,
+        price: variant?.price || null,
         collectrId: node.collectrId?.value || null,
         collectrUrl: node.collectrUrl?.value || null,
-        subType: node.subType?.value || null,
+        subType: enriched.subType,
+        cardNumber: enriched.cardNumber,
+        needsMetafieldBackfill: enriched.needsMetafieldBackfill,
+        cardNumberMetaMissing: enriched.cardNumberMetaMissing,
+        subTypeMetaMissing: enriched.subTypeMetaMissing,
         multiplier: node.multiplier?.value ? parseFloat(node.multiplier.value) : 1.0,
       });
     }
@@ -967,6 +1088,9 @@ module.exports = {
   bulkAddCards,
   buildListingIndex,
   updateProductPrice,
+  ensureProductCardFields,
+  parseCardFieldsFromDescription,
+  enrichManagedProductFields,
   getManagedProducts,
   getManagedProductsCached,
   invalidateManagedProductsCache,

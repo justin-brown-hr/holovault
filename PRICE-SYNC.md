@@ -7,7 +7,11 @@
    - `custom.collectr_url` — link with `?productId=…`
    - `custom.card_sub_type` — e.g. Holofoil, Reverse Holofoil, Normal
 
-2. **Sync** (button or daily cron) searches Collectr by product title and matches **`product_id`**, not “first search result”. That fixes wrong prices when many variants share a name.
+2. **Sync** (button or daily cron) matches Collectr in two steps:
+   - **Card number** (e.g. `058/159`) from `custom.card_number`, or parsed from product description (`Number: 125/159`)
+   - **Finish** (e.g. Normal) from `custom.card_sub_type`, description (`Finish: Normal`), or title suffix (` — Normal`)
+   Legacy products without metafields are backfilled automatically on sync.
+   Never uses “first search result” or title-only matching.
 
 3. **USD → NZD**: Collectr prices are USD; Shopify price = `USD × multiplier × live NZD rate`.
 
