@@ -783,9 +783,6 @@
       if (!res.ok) throw new Error(data.error || 'Search failed');
       searchResults = data.cards || [];
       selectedIndices = new Set();
-      searchResults.forEach((c, i) => {
-        if (isNewCard(c)) selectedIndices.add(i);
-      });
       updateBulkBar();
       renderSearchResults(searchResults);
     } catch (err) {
