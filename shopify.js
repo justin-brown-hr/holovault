@@ -251,38 +251,84 @@ async function enableInventoryTracking(variantId) {
 /**
  * Create smart collection for a TCG set (subcategory) if missing.
  */
+async function upsertSmartCollection(def) {
+  const { client } = await getClient();
+  const existingRes = await client.get('/smart_collections.json', {
+    params: { handle: def.handle, limit: 1 },
+  });
+  const existing = existingRes.data.smart_collections?.[0];
+
+  const payload = {
+    smart_collection: {
+      title: def.title,
+      handle: def.handle,
+      body_html: def.body_html,
+      published: true,
+      disjunctive: false,
+      rules: def.rules,
+      sort_order: def.sort_order || 'created-desc',
+    },
+  };
+
+  if (existing) {
+    await client.put(`/smart_collections/${existing.id}.json`, payload);
+    console.log(`[Shopify] Collection updated: ${def.title} (/collections/${def.handle})`);
+    return existing.id;
+  }
+
+  const res = await client.post('/smart_collections.json', payload);
+  console.log(`[Shopify] Collection created: ${def.title} (/collections/${def.handle})`);
+  return res.data.smart_collection.id;
+}
+
+/** Homepage + nav collections — newest first so Recently Added shows latest cards. */
+async function ensureHomepageCollections() {
+  const defs = [
+    {
+      title: 'Recently Added Singles',
+      handle: 'new-arrivals',
+      body_html: '<p>Latest singles added to HoloVault.</p>',
+      rules: [{ column: 'tag', relation: 'equals', condition: 'collectr-managed' }],
+      sort_order: 'created-desc',
+    },
+    {
+      title: 'Pokémon',
+      handle: 'pokemon',
+      body_html: '<p>All Pokémon TCG singles at HoloVault.</p>',
+      rules: [{ column: 'tag', relation: 'equals', condition: 'pokemon' }],
+      sort_order: 'created-desc',
+    },
+    {
+      title: 'Singles',
+      handle: 'singles',
+      body_html: '<p>Individual Pokémon TCG singles.</p>',
+      rules: [{ column: 'type', relation: 'equals', condition: 'Pokemon Card' }],
+      sort_order: 'created-desc',
+    },
+  ];
+
+  for (const def of defs) {
+    try {
+      await upsertSmartCollection(def);
+    } catch (err) {
+      console.warn(`[Shopify] Collection ${def.handle} skipped:`, formatShopifyError(err));
+    }
+  }
+}
+
 async function ensureSetSmartCollection(setName) {
   if (!setName || !setName.trim()) return null;
   const tag = slugifyTag(setName);
   const handle = tag;
   if (CORE_COLLECTION_HANDLES.has(handle)) return null;
 
-  const { client } = await getClient();
-  const existingRes = await client.get('/smart_collections.json', {
-    params: { handle, limit: 1 },
+  return upsertSmartCollection({
+    title: setName.trim(),
+    handle,
+    body_html: `<p>Pokémon TCG singles from ${setName.trim()}.</p>`,
+    rules: [{ column: 'tag', relation: 'equals', condition: tag }],
+    sort_order: 'created-desc',
   });
-  const existing = existingRes.data.smart_collections?.[0];
-
-  const payload = {
-    smart_collection: {
-      title: setName.trim(),
-      handle,
-      body_html: `<p>Pokémon TCG singles from ${setName.trim()}.</p>`,
-      published: true,
-      disjunctive: false,
-      rules: [{ column: 'tag', relation: 'equals', condition: tag }],
-    },
-  };
-
-  if (existing) {
-    await client.put(`/smart_collections/${existing.id}.json`, payload);
-    console.log(`[Shopify] Set collection updated: ${setName} (/collections/${handle})`);
-    return existing.id;
-  }
-
-  const res = await client.post('/smart_collections.json', payload);
-  console.log(`[Shopify] Set collection created: ${setName} (/collections/${handle})`);
-  return res.data.smart_collection.id;
 }
 
 function formatSubTypeForStore(subType) {
@@ -408,11 +454,18 @@ async function createProduct(card, multiplier = 1.0, options = {}) {
     multiplier,
   });
 
-  if (!skipCollection && card.setName) {
+  if (!skipCollection) {
     try {
-      await ensureSetSmartCollection(card.setName);
+      await ensureHomepageCollections();
     } catch (err) {
-      console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+      console.warn('[Shopify] Homepage collections skipped:', formatShopifyError(err));
+    }
+    if (card.setName) {
+      try {
+        await ensureSetSmartCollection(card.setName);
+      } catch (err) {
+        console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+      }
     }
   }
 
@@ -640,11 +693,18 @@ async function incrementProductStock(existing, card, multiplier = 1.0, options =
     usdRate
   );
 
-  if (!skipCollection && card.setName) {
+  if (!skipCollection) {
     try {
-      await ensureSetSmartCollection(card.setName);
+      await ensureHomepageCollections();
     } catch (err) {
-      console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+      console.warn('[Shopify] Homepage collections skipped:', formatShopifyError(err));
+    }
+    if (card.setName) {
+      try {
+        await ensureSetSmartCollection(card.setName);
+      } catch (err) {
+        console.warn('[Shopify] Set collection skipped:', formatShopifyError(err));
+      }
     }
   }
 
@@ -786,6 +846,12 @@ async function bulkAddCards(cards, defaultMultiplier = 1.0, options = {}) {
     }
   }
 
+  try {
+    await ensureHomepageCollections();
+  } catch (err) {
+    console.warn('[Bulk] Homepage collections skipped:', formatShopifyError(err));
+  }
+
   for (const setName of setsToEnsure) {
     try {
       await ensureSetSmartCollection(setName);
@@ -916,12 +982,13 @@ async function getManagedProducts() {
   const { client } = await getClient();
   const query = `
     query ManagedProducts($cursor: String) {
-      products(first: 50, query: "tag:collectr-managed", after: $cursor) {
+      products(first: 50, query: "tag:collectr-managed", sortKey: CREATED_AT, reverse: true, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         edges {
           node {
             legacyResourceId
             title
+            createdAt
             descriptionHtml
             featuredImage { url }
             variants(first: 1) {
@@ -979,6 +1046,7 @@ async function getManagedProducts() {
         inventoryManagement: variant?.inventoryItem?.id ? 'shopify' : null,
         inventoryQuantity,
         title: node.title,
+        createdAt: node.createdAt || null,
         imageUrl: node.featuredImage?.url || null,
         price: variant?.price || null,
         collectrId: node.collectrId?.value || null,
@@ -995,6 +1063,7 @@ async function getManagedProducts() {
     cursor = connection?.pageInfo?.endCursor || null;
   }
 
+  result.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   return result;
 }
 
@@ -1102,6 +1171,7 @@ module.exports = {
   deleteProduct,
   deleteAllManagedProducts,
   ensureSetSmartCollection,
+  ensureHomepageCollections,
   slugifyTag,
   formatShopifyError,
   checkInventoryApiAccess,

@@ -25,6 +25,8 @@ const {
   ensureAccessToken,
 } = require('./shopify');
 const { syncAllPrices, syncProductById } = require('./sync-prices');
+const { hasOpenAiKey, searchByCardImage } = require('./card-vision');
+const { bulkImportPhotos } = require('./bulk-import-photos');
 
 function getConfig() {
   return {
@@ -41,7 +43,7 @@ function getConfig() {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -77,6 +79,7 @@ app.get('/api/status', async (req, res) => {
     scopes: auth.scopes,
     tokenExpiresAt: auth.expiresAt,
     tokenExpiresInHours: auth.expiresInHours,
+    imageSearch: hasOpenAiKey(),
   });
 });
 
@@ -93,6 +96,31 @@ app.get('/api/search', async (req, res) => {
     res.json({ cards });
   } catch (err) {
     console.error('[Search] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/search-image', async (req, res) => {
+  const { image, mimeType } = req.body || {};
+  if (!image || typeof image !== 'string') {
+    return res.status(400).json({ error: 'Upload an image (base64 in JSON body).' });
+  }
+  if (!hasOpenAiKey()) {
+    return res.status(503).json({
+      error: 'OPENAI_API_KEY missing — add your key to .env and restart the app.',
+    });
+  }
+
+  const clean = image.replace(/^data:[^;]+;base64,/, '');
+
+  try {
+    const { cards, parsed, searchMethod, queriesTried } = await searchByCardImage(
+      clean,
+      mimeType || 'image/jpeg'
+    );
+    res.json({ cards, parsed, searchMethod, queriesTried });
+  } catch (err) {
+    console.error('[ImageSearch] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -131,6 +159,49 @@ app.post('/api/add-card', requireToken, async (req, res) => {
       shopify: shopifyDetail || null,
     });
   }
+});
+
+app.post('/api/bulk-import-photos', requireToken, async (req, res) => {
+  const { photos, multiplier } = req.body || {};
+  const { sync } = getConfig();
+  const mult = parseFloat(multiplier) || sync.defaultMultiplier;
+  const useStream =
+    req.query.stream === '1' || String(req.headers.accept || '').includes('text/event-stream');
+
+  if (!hasOpenAiKey()) {
+    return res.status(503).json({
+      error: 'OPENAI_API_KEY missing — add your key to .env and restart the app.',
+    });
+  }
+
+  if (!Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: 'Send { photos: [{ image, mimeType, filename }] }.' });
+  }
+
+  if (!useStream) {
+    try {
+      const results = await bulkImportPhotos(photos, mult);
+      res.json({ success: true, ...results });
+    } catch (err) {
+      console.error('Bulk photo import error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+    return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (res.flushHeaders) res.flushHeaders();
+
+  try {
+    await bulkImportPhotos(photos, mult, (event) => writeSse(res, event));
+  } catch (err) {
+    console.error('Bulk photo stream error:', err.message);
+    writeSse(res, { type: 'error', error: err.message });
+  }
+  res.end();
 });
 
 app.post('/api/bulk-add', requireToken, async (req, res) => {
@@ -225,39 +296,150 @@ function writeSse(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-app.post('/api/sync', requireToken, async (req, res) => {
-  const useStream =
-    req.query.stream === '1' || String(req.headers.accept || '').includes('text/event-stream');
+const syncJobs = new Map();
+let activeSyncJobId = null;
 
-  if (!useStream) {
-    try {
-      const results = await syncAllPrices();
-      res.json({
-        success: true,
-        updated: results.success,
-        failed: results.failed,
-        errors: results.errors,
-      });
-    } catch (err) {
-      console.error('Sync error:', err.message);
-      res.status(500).json({ success: false, error: err.message });
-    }
+function createSyncJob() {
+  const id = `sync_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    status: 'running',
+    phase: 'starting',
+    message: 'Starting…',
+    total: 0,
+    current: 0,
+    updated: 0,
+    failed: 0,
+    detail: '',
+    errors: [],
+    startedAt: now,
+    finishedAt: null,
+  };
+  syncJobs.set(id, job);
+  activeSyncJobId = id;
+  return job;
+}
+
+function applySyncEvent(job, evt) {
+  if (!evt || !job) return;
+  if (evt.type === 'phase') {
+    job.message = evt.message || job.message;
+    job.phase = 'phase';
     return;
   }
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  if (res.flushHeaders) res.flushHeaders();
-
-  try {
-    await syncAllPrices((event) => writeSse(res, event));
-  } catch (err) {
-    console.error('Sync stream error:', err.message);
-    writeSse(res, { type: 'error', error: err.message });
+  if (evt.type === 'start') {
+    job.total = evt.total || 0;
+    job.current = 0;
+    job.updated = 0;
+    job.failed = 0;
+    job.phase = 'running';
+    job.message = `Syncing ${job.total} products…`;
+    return;
   }
-  res.end();
+  if (evt.type === 'progress') {
+    if (evt.current != null) job.current = evt.current;
+    if (evt.total != null) job.total = evt.total;
+    if (evt.updated != null) job.updated = evt.updated;
+    if (evt.failed != null) job.failed = evt.failed;
+    if (evt.phase) job.phase = evt.phase;
+    job.message =
+      evt.current != null && evt.total != null
+        ? `Card ${evt.current} of ${evt.total}`
+        : job.message;
+    job.detail = evt.detail || evt.title || '';
+    return;
+  }
+  if (evt.type === 'item') {
+    if (evt.current != null) job.current = evt.current;
+    if (evt.total != null) job.total = evt.total;
+    if (evt.updated != null) job.updated = evt.updated;
+    if (evt.failed != null) job.failed = evt.failed;
+    if (!evt.ok) {
+      job.errors.push({
+        product: evt.title || 'Product',
+        error: evt.error || 'Sync failed',
+      });
+    }
+    job.detail = evt.ok
+      ? `✓ ${evt.title || ''}${evt.price ? ` → $${evt.price}` : ''}`.trim()
+      : `✗ ${evt.title || ''}: ${evt.error || 'Sync failed'}`.trim();
+    return;
+  }
+  if (evt.type === 'done') {
+    job.status = 'done';
+    job.phase = 'done';
+    job.total = evt.total || job.total;
+    job.updated = evt.updated ?? evt.success ?? job.updated;
+    job.failed = evt.failed ?? job.failed;
+    job.errors = Array.isArray(evt.errors) ? evt.errors : job.errors;
+    job.message = `Done — ${job.updated} updated, ${job.failed} failed`;
+    job.detail = '';
+    job.finishedAt = new Date().toISOString();
+  }
+}
+
+function startSyncJob() {
+  const job = createSyncJob();
+  (async () => {
+    try {
+      await syncAllPrices((evt) => applySyncEvent(job, evt));
+      if (job.status !== 'done') {
+        job.status = 'done';
+        job.phase = 'done';
+        job.finishedAt = new Date().toISOString();
+      }
+    } catch (err) {
+      console.error('Sync job error:', err.message);
+      job.status = 'failed';
+      job.phase = 'failed';
+      job.message = err.message || 'Sync failed';
+      job.errors.push({ product: 'Sync job', error: job.message });
+      job.finishedAt = new Date().toISOString();
+    } finally {
+      if (activeSyncJobId === job.id) activeSyncJobId = null;
+    }
+  })();
+  return job;
+}
+
+app.post('/api/sync/start', requireToken, async (req, res) => {
+  if (activeSyncJobId) {
+    const running = syncJobs.get(activeSyncJobId);
+    if (running && running.status === 'running') {
+      return res.status(409).json({
+        success: false,
+        error: 'A sync is already running.',
+        jobId: running.id,
+        job: running,
+      });
+    }
+  }
+  const job = startSyncJob();
+  res.json({ success: true, jobId: job.id, job });
+});
+
+app.get('/api/sync/status/:id', requireToken, async (req, res) => {
+  const job = syncJobs.get(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'Sync job not found' });
+  }
+  res.json({ success: true, job });
+});
+
+app.post('/api/sync', requireToken, async (req, res) => {
+  try {
+    const results = await syncAllPrices();
+    res.json({
+      success: true,
+      updated: results.success,
+      failed: results.failed,
+      errors: results.errors,
+    });
+  } catch (err) {
+    console.error('Sync error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ── Cron ──────────────────────────────────────────────────────────────────────
