@@ -4,6 +4,9 @@
  */
 
 const { hasOpenAiKey, parseCardImage, searchCollectrFromParsed, pickAutoCollectrCard } = require('./card-vision');
+const { parseCardFromImageOffline } = require('./local-ocr');
+const { searchCards } = require('./collectr');
+const { cardNumbersMatch } = require('./collectr-match');
 const { addOrUpdateProduct, formatShopifyError } = require('./shopify');
 
 function sleep(ms) {
@@ -20,16 +23,16 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
     if (typeof onProgress === 'function') onProgress(payload);
   };
 
-  if (!hasOpenAiKey()) {
-    throw new Error('OPENAI_API_KEY missing — add your key to .env and restart the app.');
-  }
-
   const maxPhotos = parseInt(process.env.BULK_PHOTO_MAX || '25', 10);
+  const maxPhotosOcr = parseInt(process.env.BULK_PHOTO_OCR_MAX || '10', 10);
   if (!photos?.length) {
     throw new Error('Send at least one photo.');
   }
   if (photos.length > maxPhotos) {
     throw new Error(`Bulk photo import limited to ${maxPhotos} images per batch.`);
+  }
+  if (!hasOpenAiKey() && photos.length > maxPhotosOcr) {
+    throw new Error(`Bulk photo import without OpenAI is limited to ${maxPhotosOcr} images per batch.`);
   }
 
   const total = photos.length;
@@ -57,23 +60,73 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
     try {
       if (!base64) throw new Error('Empty image data');
 
-      const parsed = await parseCardImage(base64, mimeType);
-      console.log(`[BulkPhoto] ${label} parsed:`, parsed);
+      let parsed;
+      let cards;
+      let searchMethod = null;
+      let card = null;
+      let reason = null;
 
-      emit({
-        type: 'progress',
-        current,
-        total,
-        filename: label,
-        phase: 'collectr',
-        detail: `#${parsed.cardNumber || '?'} · ${parsed.name || '?'}`,
-        added: results.added,
-        incremented: results.incremented,
-        failed: results.failed,
-      });
+      if (hasOpenAiKey()) {
+        parsed = await parseCardImage(base64, mimeType);
+        console.log(`[BulkPhoto] ${label} parsed (openai):`, parsed);
 
-      const { cards, searchMethod } = await searchCollectrFromParsed(parsed);
-      const { card, reason } = pickAutoCollectrCard(cards, parsed);
+        emit({
+          type: 'progress',
+          current,
+          total,
+          filename: label,
+          phase: 'collectr',
+          detail: `#${parsed.cardNumber || '?'} · ${parsed.name || '?'}`,
+          added: results.added,
+          incremented: results.incremented,
+          failed: results.failed,
+        });
+
+        const r = await searchCollectrFromParsed(parsed);
+        cards = r.cards;
+        searchMethod = r.searchMethod;
+        const picked = pickAutoCollectrCard(cards, parsed);
+        card = picked.card;
+        reason = picked.reason;
+      } else {
+        const offline = await parseCardFromImageOffline(base64, mimeType);
+        parsed = {
+          name: '',
+          cardNumber: offline.cardNumber || '',
+          setName: '',
+          subType: '',
+          language: 'other',
+          confidence: offline.confidence,
+        };
+        console.log(`[BulkPhoto] ${label} parsed (ocr):`, parsed, offline.cardNumbers);
+
+        if (!parsed.cardNumber) {
+          throw new Error('Could not read card number from photo (offline OCR)');
+        }
+
+        emit({
+          type: 'progress',
+          current,
+          total,
+          filename: label,
+          phase: 'collectr',
+          detail: `#${parsed.cardNumber}`,
+          added: results.added,
+          incremented: results.incremented,
+          failed: results.failed,
+        });
+
+        cards = await searchCards(parsed.cardNumber);
+        searchMethod = 'card_number';
+        const byNum = (cards || []).filter((c) => cardNumbersMatch(c.cardNumber, parsed.cardNumber));
+        if (byNum.length === 1) {
+          card = byNum[0];
+        } else if (byNum.length === 0) {
+          reason = 'No Collectr match for this card number';
+        } else {
+          reason = `${byNum.length} matches for this number (different finishes) — needs OpenAI or manual search`;
+        }
+      }
 
       if (!card) {
         throw new Error(reason || 'No matching Collectr listing');

@@ -27,6 +27,7 @@ const {
 const { syncAllPrices, syncProductById } = require('./sync-prices');
 const { hasOpenAiKey, searchByCardImage } = require('./card-vision');
 const { bulkImportPhotos } = require('./bulk-import-photos');
+const { parseCardFromImageOffline } = require('./local-ocr');
 
 function getConfig() {
   return {
@@ -105,20 +106,35 @@ app.post('/api/search-image', async (req, res) => {
   if (!image || typeof image !== 'string') {
     return res.status(400).json({ error: 'Upload an image (base64 in JSON body).' });
   }
-  if (!hasOpenAiKey()) {
-    return res.status(503).json({
-      error: 'OPENAI_API_KEY missing — add your key to .env and restart the app.',
-    });
-  }
 
   const clean = image.replace(/^data:[^;]+;base64,/, '');
 
   try {
-    const { cards, parsed, searchMethod, queriesTried } = await searchByCardImage(
-      clean,
-      mimeType || 'image/jpeg'
-    );
-    res.json({ cards, parsed, searchMethod, queriesTried });
+    if (hasOpenAiKey()) {
+      const { cards, parsed, searchMethod, queriesTried } = await searchByCardImage(
+        clean,
+        mimeType || 'image/jpeg'
+      );
+      res.json({ cards, parsed, searchMethod, queriesTried, mode: 'openai' });
+    } else {
+      const offline = await parseCardFromImageOffline(clean, mimeType || 'image/jpeg');
+      const cardNumber = offline.cardNumber;
+      if (!cardNumber) {
+        return res.status(422).json({
+          error: 'Could not read card number from photo (offline OCR). Try a clearer photo.',
+          parsed: offline,
+          mode: 'ocr',
+        });
+      }
+      const cards = await searchCards(cardNumber);
+      res.json({
+        cards,
+        parsed: { name: '', cardNumber, setName: '', subType: '', language: 'other', confidence: offline.confidence },
+        searchMethod: 'card_number',
+        queriesTried: [cardNumber],
+        mode: 'ocr',
+      });
+    }
   } catch (err) {
     console.error('[ImageSearch] Error:', err.message);
     res.status(500).json({ error: err.message });
@@ -167,12 +183,6 @@ app.post('/api/bulk-import-photos', requireToken, async (req, res) => {
   const mult = parseFloat(multiplier) || sync.defaultMultiplier;
   const useStream =
     req.query.stream === '1' || String(req.headers.accept || '').includes('text/event-stream');
-
-  if (!hasOpenAiKey()) {
-    return res.status(503).json({
-      error: 'OPENAI_API_KEY missing — add your key to .env and restart the app.',
-    });
-  }
 
   if (!Array.isArray(photos) || photos.length === 0) {
     return res.status(400).json({ error: 'Send { photos: [{ image, mimeType, filename }] }.' });

@@ -453,6 +453,18 @@
       color: #93c5fd;
       flex: 1;
     }
+    .image-search-preview button {
+      background: transparent;
+      color: #aaa;
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .image-search-preview button:hover { color: #fff; border-color: #666; }
 
     .bulk-photo-btn {
       background: #16a34a;
@@ -789,11 +801,12 @@
           📦 Bulk import photos
         </label>
         <input type="file" id="bulk-photo-input" accept="image/jpeg,image/png,image/webp,image/gif" multiple onchange="onBulkPhotosSelected(event)" />
-        <span class="image-search-hint" id="image-search-hint">Upload a card photo — reads name &amp; number, searches Collectr by # first, then name. Needs OPENAI_API_KEY in .env</span>
+        <span class="image-search-hint" id="image-search-hint">Upload a card photo — reads the card number and searches Collectr by #. (With OPENAI_API_KEY it also reads name/finish and is more accurate.)</span>
       </div>
       <div class="image-search-preview" id="image-search-preview">
         <img id="image-search-thumb" alt="" />
         <span id="image-search-parsed"></span>
+        <button type="button" onclick="clearSearchResults()">Clear</button>
       </div>
       <div class="bulk-bar bulk-bar--idle" id="bulk-bar">
         <button type="button" class="bulk-btn bulk-btn-primary" id="bulk-add-selected-btn" onclick="bulkAddSelected()">
@@ -889,6 +902,15 @@
     document.getElementById('image-search-preview').classList.remove('visible');
   }
 
+  function clearSearchResults() {
+    searchResults = [];
+    selectedIndices = new Set();
+    updateBulkBar();
+    hideImageSearchPreview();
+    document.getElementById('search-results').innerHTML =
+      '<div class="empty-state">Search for a card to get started.</div>';
+  }
+
   function showImageSearchPreview(dataUrl, parsed, searchMethod) {
     const box = document.getElementById('image-search-preview');
     document.getElementById('image-search-thumb').src = dataUrl;
@@ -978,9 +1000,9 @@
           'Single photo = search only. Bulk import photos = auto-match Collectr + add to Shopify (shows progress). Uses × multiplier below.';
         bulkLabel.classList.remove('disabled');
       } else {
-        hint.textContent = 'Add OPENAI_API_KEY to .env and restart the app to enable photo search.';
-        label.classList.add('disabled');
-        bulkLabel.classList.add('disabled');
+        hint.textContent =
+          'Photo search works without OpenAI (offline OCR by card # only). Bulk import also works but only if the number has a single match (finishes can cause duplicates). Add OPENAI_API_KEY for best accuracy.';
+        bulkLabel.classList.remove('disabled');
       }
     } catch (_) {}
   }
@@ -1049,7 +1071,7 @@
         throw new Error(errData.error || 'Bulk photo import failed');
       }
 
-      let finalResult = null;
+      // uses the outer finalResult
 
       await readSseStream(res, (evt) => {
         if (evt.type === 'start') {
