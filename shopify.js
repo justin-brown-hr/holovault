@@ -171,17 +171,32 @@ function normalizeInventoryItemId(id) {
   return null;
 }
 
+/** REST product/variant ids must be numeric (not GID strings). */
+function normalizeLegacyResourceId(id) {
+  if (id == null || id === '') return null;
+  const s = String(id).trim();
+  const gid = s.match(/\/(\d+)$/);
+  if (gid) return gid[1];
+  if (/^\d+$/.test(s)) return s;
+  return null;
+}
+
 async function getInventoryQuantity(inventoryItemId) {
   const itemId = normalizeInventoryItemId(inventoryItemId);
   if (!itemId) return 0;
   const { client } = await getClient();
   const locationId = await getPrimaryLocationId();
   if (!locationId) return 0;
-  const res = await client.get('/inventory_levels.json', {
-    params: { inventory_item_ids: itemId, location_ids: locationId },
-  });
-  const level = res.data.inventory_levels?.[0];
-  return level ? level.available : 0;
+  try {
+    const res = await client.get('/inventory_levels.json', {
+      params: { inventory_item_ids: itemId, location_ids: locationId },
+    });
+    const level = res.data.inventory_levels?.[0];
+    return level ? level.available : 0;
+  } catch (err) {
+    if (err.response?.status === 404) return 0;
+    throw err;
+  }
 }
 
 async function setInventoryQuantity(inventoryItemId, quantity) {
@@ -190,18 +205,36 @@ async function setInventoryQuantity(inventoryItemId, quantity) {
   const locationId = await getPrimaryLocationId();
   if (!locationId) return null;
   const { client } = await getClient();
-  await client.post('/inventory_levels/set.json', {
+  const payload = {
     location_id: locationId,
     inventory_item_id: itemId,
     available: Math.max(0, quantity),
-  });
+  };
+
+  try {
+    await client.post('/inventory_levels/set.json', payload);
+  } catch (err) {
+    if (err.response?.status === 404) {
+      await client.post('/inventory_levels/connect.json', {
+        location_id: locationId,
+        inventory_item_id: itemId,
+      });
+      await client.post('/inventory_levels/set.json', payload);
+    } else {
+      throw err;
+    }
+  }
   return Math.max(0, quantity);
 }
 
 /** After product create, Shopify may not return inventory_item_id until tracking is enabled. */
 async function resolveInventoryItemId(client, productId, variantId) {
+  const pid = normalizeLegacyResourceId(productId);
+  const vid = normalizeLegacyResourceId(variantId);
+  if (!pid) return null;
+
   const fetchVariant = async () => {
-    const res = await client.get(`/products/${productId}.json`);
+    const res = await client.get(`/products/${pid}.json`);
     return res.data.product?.variants?.[0];
   };
 
@@ -209,8 +242,8 @@ async function resolveInventoryItemId(client, productId, variantId) {
   let itemId = normalizeInventoryItemId(variant?.inventory_item_id);
   if (itemId) return itemId;
 
-  if (variantId) {
-    await enableInventoryTracking(variantId);
+  if (vid) {
+    await enableInventoryTracking(vid);
     variant = await fetchVariant();
     itemId = normalizeInventoryItemId(variant?.inventory_item_id);
   }
@@ -218,30 +251,55 @@ async function resolveInventoryItemId(client, productId, variantId) {
 }
 
 async function getStockMetafield(productId) {
+  const pid = normalizeLegacyResourceId(productId);
+  if (!pid) return 0;
   const { client } = await getClient();
-  const res = await client.get(`/products/${productId}/metafields.json`).catch(() => ({ data: { metafields: [] } }));
+  const res = await client.get(`/products/${pid}/metafields.json`).catch(() => ({ data: { metafields: [] } }));
   const mf = res.data.metafields?.find((m) => m.namespace === 'custom' && m.key === 'stock_qty');
   return mf ? parseInt(mf.value, 10) || 0 : 0;
 }
 
 async function setStockMetafield(productId, quantity) {
+  const pid = normalizeLegacyResourceId(productId);
+  if (!pid) return Math.max(0, quantity);
+  const qty = Math.max(0, quantity);
   const { client } = await getClient();
-  await client.post(`/products/${productId}/metafields.json`, {
-    metafield: {
-      namespace: 'custom',
-      key: 'stock_qty',
-      value: String(Math.max(0, quantity)),
-      type: 'number_integer',
-    },
-  }).catch(() => {});
-  return Math.max(0, quantity);
+  const mutation = `
+    mutation StockQtySet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  try {
+    const data = await shopifyGraphql(client, mutation, {
+      metafields: [
+        {
+          ownerId: `gid://shopify/Product/${pid}`,
+          namespace: 'custom',
+          key: 'stock_qty',
+          type: 'number_integer',
+          value: String(qty),
+        },
+      ],
+    });
+    const errors = data?.metafieldsSet?.userErrors;
+    if (errors?.length) {
+      console.warn('[Shopify] stock_qty metafield:', errors.map((e) => e.message).join('; '));
+    }
+  } catch (err) {
+    console.warn('[Shopify] stock_qty metafield failed:', formatShopifyError(err));
+  }
+  return qty;
 }
 
 async function enableInventoryTracking(variantId) {
+  const vid = normalizeLegacyResourceId(variantId);
+  if (!vid) return;
   const { client } = await getClient();
-  await client.put(`/variants/${variantId}.json`, {
+  await client.put(`/variants/${vid}.json`, {
     variant: {
-      id: variantId,
+      id: vid,
       inventory_management: 'shopify',
       inventory_policy: 'deny',
     },
@@ -649,15 +707,22 @@ async function incrementProductStock(existing, card, multiplier = 1.0, options =
   let newQty;
   let warning = null;
 
-  if (useInventory) {
-    let inventoryItemId = existing.inventoryItemId;
+  const productId = normalizeLegacyResourceId(existing.productId);
+  const variantId = normalizeLegacyResourceId(existing.variantId);
+  const listing = { ...existing, productId, variantId };
 
-    inventoryItemId = normalizeInventoryItemId(inventoryItemId);
+  if (useInventory) {
+    let inventoryItemId = normalizeInventoryItemId(listing.inventoryItemId);
+
     if (!inventoryItemId) {
-      inventoryItemId = await resolveInventoryItemId(client, existing.productId, existing.variantId);
-    } else if (existing.inventoryManagement !== 'shopify' && existing.variantId) {
-      await enableInventoryTracking(existing.variantId);
-      inventoryItemId = await resolveInventoryItemId(client, existing.productId, existing.variantId);
+      inventoryItemId = await resolveInventoryItemId(client, productId, variantId);
+    } else if (listing.inventoryManagement !== 'shopify' && variantId) {
+      try {
+        await enableInventoryTracking(variantId);
+        inventoryItemId = await resolveInventoryItemId(client, productId, variantId);
+      } catch (err) {
+        console.warn('[Shopify] Enable inventory tracking skipped:', formatShopifyError(err));
+      }
     }
 
     if (inventoryItemId) {
@@ -667,31 +732,31 @@ async function incrementProductStock(existing, card, multiplier = 1.0, options =
         await setInventoryQuantity(inventoryItemId, newQty);
       } catch (err) {
         console.warn('[Shopify] Inventory bump failed, using stock metafield:', formatShopifyError(err));
-        const currentQty = await getStockMetafield(existing.productId);
+        const currentQty = await getStockMetafield(productId);
         newQty = currentQty + 1;
-        await setStockMetafield(existing.productId, newQty);
+        await setStockMetafield(productId, newQty);
         warning = STOCK_SCOPE_HINT;
       }
     } else {
-      const currentQty = await getStockMetafield(existing.productId);
+      const currentQty = await getStockMetafield(productId);
       newQty = currentQty + 1;
-      await setStockMetafield(existing.productId, newQty);
+      await setStockMetafield(productId, newQty);
       warning = STOCK_SCOPE_HINT;
     }
   } else {
-    const currentQty = await getStockMetafield(existing.productId);
+    const currentQty = await getStockMetafield(productId);
     newQty = currentQty + 1;
-    await setStockMetafield(existing.productId, newQty);
+    await setStockMetafield(productId, newQty);
     warning = STOCK_SCOPE_HINT;
   }
 
-  const finalPrice = await updateProductPrice(
-    existing.productId,
-    existing.variantId,
-    card,
-    multiplier,
-    usdRate
-  );
+  let finalPrice = null;
+  try {
+    finalPrice = await updateProductPrice(productId, variantId, card, multiplier, usdRate);
+  } catch (err) {
+    console.warn('[Shopify] Price update skipped on stock increment:', formatShopifyError(err));
+    warning = warning || formatShopifyError(err);
+  }
 
   if (!skipCollection) {
     try {
@@ -708,18 +773,29 @@ async function incrementProductStock(existing, card, multiplier = 1.0, options =
     }
   }
 
-  const res = await client.get(`/products/${existing.productId}.json`);
-  const updated = res.data.product;
+  let updated = null;
+  try {
+    const res = await client.get(`/products/${productId}.json`);
+    updated = res.data.product;
+  } catch (err) {
+    console.warn('[Shopify] Product refresh skipped after increment:', formatShopifyError(err));
+    updated = {
+      id: productId,
+      title: listing.title,
+      variants: variantId ? [{ id: variantId, inventory_quantity: newQty }] : [],
+    };
+  }
+
   const variant = updated.variants?.[0];
   cacheCollectrListing(card, {
-    ...existing,
-    productId: updated.id,
-    variantId: variant?.id,
+    ...listing,
+    productId: updated.id || productId,
+    variantId: variant?.id || variantId,
     inventoryItemId:
-      normalizeInventoryItemId(variant?.inventory_item_id) || existing.inventoryItemId,
+      normalizeInventoryItemId(variant?.inventory_item_id) || listing.inventoryItemId,
     inventoryQuantity: newQty,
-    title: updated.title,
-    subType: card.subType || existing.subType,
+    title: updated.title || listing.title,
+    subType: card.subType || listing.subType,
   });
 
   if (!skipCacheInvalidate) invalidateManagedProductsCache();
@@ -762,18 +838,29 @@ async function addOrUpdateProduct(card, multiplier = 1.0, options = {}) {
 }
 
 async function updateProductPrice(productId, variantId, card, multiplier = 1.0, usdRate = null) {
+  const pid = normalizeLegacyResourceId(productId);
+  let vid = normalizeLegacyResourceId(variantId);
   const { client } = await getClient();
+
+  if (!vid && pid) {
+    const res = await client.get(`/products/${pid}.json`);
+    vid = res.data.product?.variants?.[0]?.id;
+  }
+  if (!vid) {
+    throw new Error(`No variant found for product ${pid || productId}`);
+  }
+
   const rate = usdRate ?? (await getUsdToNzdRate());
   const finalPrice = (card.price * multiplier * rate).toFixed(2);
 
-  await client.put(`/variants/${variantId}.json`, {
+  await client.put(`/variants/${vid}.json`, {
     variant: {
-      id: variantId,
+      id: vid,
       price: finalPrice,
     },
   });
 
-  await setProductMetafields(productId, card, multiplier);
+  await setProductMetafields(pid, card, multiplier);
 
   return finalPrice;
 }
