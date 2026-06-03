@@ -1624,7 +1624,7 @@
   async function loadProducts() {
     const container = document.getElementById('products-list');
     try {
-      const res = await fetch('/api/products');
+      const res = await fetch(`/api/products?_=${Date.now()}`, { cache: 'no-store' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to load');
       managedProducts = data.products || [];

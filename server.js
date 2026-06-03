@@ -13,8 +13,7 @@ const { searchCards, closeBrowser } = require('./collectr');
 const {
   addOrUpdateProduct,
   bulkAddCards,
-  getManagedProductsCached,
-  invalidateManagedProductsCache,
+  getManagedProducts,
   setMultiplier,
   deleteProduct,
   deleteAllManagedProducts,
@@ -52,6 +51,11 @@ function getConfig() {
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -500,8 +504,9 @@ app.post('/api/bulk-add', requireToken, async (req, res) => {
 
 app.get('/api/products', requireToken, async (req, res) => {
   try {
-    const products = await getManagedProductsCached();
-    res.json({ products });
+    res.setHeader('Cache-Control', 'no-store');
+    const products = await getManagedProducts();
+    res.json({ products, fetchedAt: new Date().toISOString() });
   } catch (err) {
     console.error('Products error:', err.message);
     res.status(500).json({ error: err.message });
@@ -552,7 +557,6 @@ app.patch('/api/products/:id/multiplier', requireToken, async (req, res) => {
 app.post('/api/products/:id/sync', requireToken, async (req, res) => {
   const { id } = req.params;
   try {
-    invalidateManagedProductsCache();
     const { newPrice, freshCard, product } = await syncProductById(id);
     res.json({
       success: true,
@@ -733,7 +737,6 @@ cron.schedule(sync.cronSchedule, async () => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  invalidateManagedProductsCache();
   const { shopify, sync: s } = getConfig();
   console.log(`\nHolo Vault Price Sync running at http://localhost:${PORT}`);
   console.log(`Shopify store: ${shopify.store}`);

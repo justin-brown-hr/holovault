@@ -1,5 +1,6 @@
 /**
- * Bulk photo import: one photo at a time — read → Collectr → Shopify add or stock +1.
+ * Bulk photo import: one photo at a time — read → Collectr → Shopify add OR stock +1.
+ * Duplicate check always queries Shopify live (no in-memory listing cache).
  */
 
 const {
@@ -12,12 +13,8 @@ const { parseCardFromImageOffline } = require('./local-ocr');
 const { searchCards } = require('./collectr');
 const {
   addOrUpdateProduct,
-  buildListingIndex,
-  getManagedProductsCached,
   ensureHomepageCollections,
-  invalidateManagedProductsCache,
   formatShopifyError,
-  listingKey,
 } = require('./shopify');
 
 function getMaxPhotos() {
@@ -57,20 +54,11 @@ async function findOnCollectr(parsed, useOpenAi) {
 }
 
 /**
- * In-memory session for sequential uploads (listing index reused across photos).
+ * Session state for sequential photo uploads (no listing index — Shopify is queried per photo).
  */
 async function createBulkSession(multiplier = 1.0) {
-  let listingIndex = null;
-  try {
-    const managed = await getManagedProductsCached();
-    listingIndex = buildListingIndex(managed);
-  } catch (e) {
-    console.warn('[BulkPhoto] Could not preload Shopify listings:', e.message);
-  }
-
   return {
     multiplier,
-    listingIndex,
     useOpenAi: hasOpenAiKey(),
     added: 0,
     incremented: 0,
@@ -126,21 +114,7 @@ async function processOneImportPhoto(photo, session) {
       console.warn(`[BulkPhoto] ${label}: ${pickNote}`);
     }
 
-    const shopResult = await addOrUpdateProduct(card, multiplier, {
-      listingIndex: session.listingIndex,
-    });
-
-    if (session.listingIndex && card.collectrId) {
-      const key = listingKey(card.collectrId, card.subType);
-      session.listingIndex.set(key, {
-        productId: shopResult.product?.id,
-        variantId: shopResult.product?.variants?.[0]?.id,
-        title: shopResult.product?.title || card.name,
-        collectrId: String(card.collectrId),
-        subType: card.subType,
-        inventoryQuantity: shopResult.quantity,
-      });
-    }
+    const shopResult = await addOrUpdateProduct(card, multiplier);
 
     if (shopResult.incremented) session.incremented += 1;
     else session.added += 1;
@@ -183,7 +157,6 @@ async function processOneImportPhoto(photo, session) {
 async function finishBulkSession(session) {
   try {
     await ensureHomepageCollections();
-    invalidateManagedProductsCache();
   } catch (e) {
     console.warn('[BulkPhoto] Homepage collections refresh skipped:', e.message);
   }
