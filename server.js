@@ -26,7 +26,13 @@ const {
 } = require('./shopify');
 const { syncAllPrices, syncProductById } = require('./sync-prices');
 const { hasOpenAiKey, searchByCardImage } = require('./card-vision');
-const { bulkImportPhotos } = require('./bulk-import-photos');
+const {
+  bulkImportPhotos,
+  createBulkSession,
+  processOneImportPhoto,
+  finishBulkSession,
+  getMaxPhotos,
+} = require('./bulk-import-photos');
 const { parseCardFromImageOffline, preloadOcr } = require('./local-ocr');
 
 function getConfig() {
@@ -237,14 +243,43 @@ function applyBulkImportEvent(job, evt) {
   }
 }
 
-function startBulkImportJob(photos, multiplier) {
+function publicBulkJob(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    status: job.status,
+    phase: job.phase,
+    message: job.message,
+    total: job.total,
+    current: job.current,
+    added: job.added,
+    incremented: job.incremented,
+    failed: job.failed,
+    filename: job.filename,
+    detail: job.detail,
+    errors: job.errors,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+  };
+}
+
+function syncJobFromSession(job, session) {
+  job.current = session.processed;
+  job.added = session.added;
+  job.incremented = session.incremented;
+  job.failed = session.failed;
+  job.errors = session.errors;
+}
+
+async function createSequentialBulkJob(multiplier, total) {
   const id = `bulk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const session = await createBulkSession(multiplier);
   const job = {
     id,
     status: 'running',
-    phase: 'starting',
-    message: 'Starting…',
-    total: photos.length,
+    phase: 'ready',
+    message: `Ready — ${total} photo${total === 1 ? '' : 's'} (one at a time)`,
+    total,
     current: 0,
     added: 0,
     incremented: 0,
@@ -254,41 +289,18 @@ function startBulkImportJob(photos, multiplier) {
     errors: [],
     startedAt: new Date().toISOString(),
     finishedAt: null,
+    _session: session,
   };
   bulkImportJobs.set(id, job);
   activeBulkImportJobId = id;
-
-  (async () => {
-    try {
-      await bulkImportPhotos(photos, multiplier, (evt) => applyBulkImportEvent(job, evt));
-      if (job.status !== 'done') {
-        job.status = 'done';
-        job.phase = 'done';
-        job.finishedAt = new Date().toISOString();
-      }
-    } catch (err) {
-      console.error('Bulk import job error:', err.message);
-      job.status = 'failed';
-      job.phase = 'failed';
-      job.message = err.message || 'Bulk import failed';
-      job.errors.push({ filename: 'Bulk import', error: job.message });
-      job.finishedAt = new Date().toISOString();
-    } finally {
-      if (activeBulkImportJobId === job.id) activeBulkImportJobId = null;
-    }
-  })();
-
   return job;
 }
 
 app.post('/api/bulk-import/start', requireToken, async (req, res) => {
-  const { photos, multiplier } = req.body || {};
+  const { photos, multiplier, total } = req.body || {};
   const { sync } = getConfig();
   const mult = parseFloat(multiplier) || sync.defaultMultiplier;
-
-  if (!Array.isArray(photos) || photos.length === 0) {
-    return res.status(400).json({ error: 'Send { photos: [{ image, mimeType, filename }] }.' });
-  }
+  const maxPhotos = getMaxPhotos();
 
   if (activeBulkImportJobId) {
     const running = bulkImportJobs.get(activeBulkImportJobId);
@@ -297,13 +309,146 @@ app.post('/api/bulk-import/start', requireToken, async (req, res) => {
         success: false,
         error: 'A bulk photo import is already running.',
         jobId: running.id,
-        job: running,
+        job: publicBulkJob(running),
       });
     }
   }
 
-  const job = startBulkImportJob(photos, mult);
-  res.json({ success: true, jobId: job.id, job });
+  // Legacy: all photos in one POST (still supported for small batches)
+  if (Array.isArray(photos) && photos.length > 0) {
+    if (photos.length > maxPhotos) {
+      return res.status(400).json({ error: `Max ${maxPhotos} photos per import.` });
+    }
+    const job = await createSequentialBulkJob(mult, photos.length);
+    job.phase = 'running';
+    job.message = `Processing ${photos.length} photos…`;
+    (async () => {
+      try {
+        for (let i = 0; i < photos.length; i++) {
+          job.filename = photos[i].filename || `Photo ${i + 1}`;
+          job.phase = 'parse';
+          const row = await processOneImportPhoto(photos[i], job._session);
+          syncJobFromSession(job, job._session);
+          job.current = i + 1;
+          job.detail = row.ok
+            ? `✓ ${row.title || job.filename}${row.wasIncrement ? ' (stock +1)' : ''}`
+            : `✗ ${job.filename}: ${row.error}`;
+          if (!row.ok) {
+            job.errors = job._session.errors;
+          }
+        }
+        await finishBulkSession(job._session);
+        job.status = 'done';
+        job.phase = 'done';
+        const listed = job.added + job.incremented;
+        job.message =
+          job.failed > 0
+            ? `Done — ${listed} listed, ${job.failed} failed`
+            : `Done — ${listed} cards on Shopify`;
+        job.finishedAt = new Date().toISOString();
+      } catch (err) {
+        job.status = 'failed';
+        job.message = err.message;
+        job.finishedAt = new Date().toISOString();
+      } finally {
+        if (activeBulkImportJobId === job.id) activeBulkImportJobId = null;
+      }
+    })();
+    return res.json({ success: true, jobId: job.id, job: publicBulkJob(job) });
+  }
+
+  const photoTotal = parseInt(total, 10) || 0;
+  if (photoTotal < 1) {
+    return res.status(400).json({ error: 'Send { total: N, multiplier } to start a sequential import.' });
+  }
+  if (photoTotal > maxPhotos) {
+    return res.status(400).json({ error: `Max ${maxPhotos} photos per import.` });
+  }
+
+  try {
+    const job = await createSequentialBulkJob(mult, photoTotal);
+    res.json({ success: true, jobId: job.id, job: publicBulkJob(job), sequential: true });
+  } catch (err) {
+    console.error('Bulk import start error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Process one photo in an active import job (upload images one-by-one). */
+app.post('/api/bulk-import/:jobId/photo', requireToken, async (req, res) => {
+  const job = bulkImportJobs.get(req.params.jobId);
+  if (!job || !job._session) {
+    return res.status(404).json({ error: 'Bulk import job not found' });
+  }
+  if (job.status !== 'running') {
+    return res.status(400).json({ error: 'Import job is not active.' });
+  }
+
+  const { image, mimeType, filename } = req.body || {};
+  if (!image) {
+    return res.status(400).json({ error: 'Send { image, mimeType, filename } for one photo.' });
+  }
+
+  job.phase = 'parse';
+  job.filename = filename || `Photo ${job.current + 1}`;
+  job.message = `Photo ${job.current + 1} of ${job.total}`;
+
+  try {
+    const row = await processOneImportPhoto(
+      { image, mimeType: mimeType || 'image/jpeg', filename: job.filename },
+      job._session
+    );
+    syncJobFromSession(job, job._session);
+    job.current = job._session.processed;
+    job.detail = row.ok
+      ? `✓ ${row.title || job.filename}${row.wasIncrement ? ' (stock +1)' : ''}`
+      : `✗ ${job.filename}: ${row.error}`;
+
+    if (job.current >= job.total) {
+      job.phase = 'finishing';
+      job.message = 'Finishing…';
+    } else {
+      job.phase = row.ok ? 'done_item' : 'failed_item';
+      job.message = `Photo ${job.current} of ${job.total}`;
+    }
+
+    res.json({
+      success: true,
+      job: publicBulkJob(job),
+      item: row,
+    });
+  } catch (err) {
+    console.error('Bulk import photo error:', err.message);
+    res.status(500).json({ error: err.message, job: publicBulkJob(job) });
+  }
+});
+
+app.post('/api/bulk-import/:jobId/finish', requireToken, async (req, res) => {
+  const job = bulkImportJobs.get(req.params.jobId);
+  if (!job || !job._session) {
+    return res.status(404).json({ error: 'Bulk import job not found' });
+  }
+
+  try {
+    await finishBulkSession(job._session);
+    syncJobFromSession(job, job._session);
+    job.status = 'done';
+    job.phase = 'done';
+    const listed = job.added + job.incremented;
+    job.message =
+      job.failed > 0
+        ? `Done — ${listed} listed, ${job.failed} failed`
+        : `Done — ${listed} cards on Shopify`;
+    job.detail = '';
+    job.finishedAt = new Date().toISOString();
+    if (activeBulkImportJobId === job.id) activeBulkImportJobId = null;
+    res.json({ success: true, job: publicBulkJob(job) });
+  } catch (err) {
+    job.status = 'failed';
+    job.message = err.message;
+    job.finishedAt = new Date().toISOString();
+    res.status(500).json({ error: err.message, job: publicBulkJob(job) });
+  }
 });
 
 app.get('/api/bulk-import/status/:id', requireToken, async (req, res) => {
@@ -311,7 +456,7 @@ app.get('/api/bulk-import/status/:id', requireToken, async (req, res) => {
   if (!job) {
     return res.status(404).json({ error: 'Bulk import job not found' });
   }
-  res.json({ success: true, job });
+  res.json({ success: true, job: publicBulkJob(job) });
 });
 
 /** @deprecated Use POST /api/bulk-import/start + poll /api/bulk-import/status/:id (SSE breaks on Railway). */

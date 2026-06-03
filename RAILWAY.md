@@ -55,7 +55,7 @@ If the repo does not appear:
 **Bulk photo import fails on Railway but works locally?**
 
 1. Redeploy after the latest `main` — bulk import uses **background job + polling** (not SSE), same fix as price sync.
-2. Keep batches small on Railway: **≤10 photos** without `OPENAI_API_KEY`, **≤9 MB total** upload size.
+2. Bulk import sends **one photo per request** (up to **100** per session by default) — no 10-photo batch limit.
 3. Check **Deployments → Logs** for `[BulkPhoto]` or `[OCR]` errors.
 4. Optional: `OCR_LANG=eng` (default in production).
 
