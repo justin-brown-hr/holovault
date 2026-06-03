@@ -133,7 +133,7 @@ function narrowResults(cards, parsed) {
 }
 
 /**
- * Pick exactly one Collectr card for auto-import (strict).
+ * Pick exactly one Collectr card for auto-import (strict finish + number when possible).
  */
 function pickAutoCollectrCard(cards, parsed) {
   if (!cards?.length) {
@@ -164,6 +164,44 @@ function pickAutoCollectrCard(cards, parsed) {
   }
 
   return { card: cards[0], reason: null };
+}
+
+/**
+ * Pick a Collectr listing for bulk photo import.
+ * Prefer strict match; if finish is unknown, use first match for that card number so we can still add to Shopify.
+ */
+function pickCardForBulkImport(cards, parsed) {
+  if (!cards?.length) {
+    return { card: null, reason: 'No Collectr results', ambiguous: false };
+  }
+
+  const strict = pickAutoCollectrCard(cards, parsed);
+  if (strict.card) {
+    return { card: strict.card, reason: null, ambiguous: false };
+  }
+
+  const narrowed = narrowResults(cards, parsed);
+  if (narrowed.length === 1) {
+    return { card: narrowed[0], reason: null, ambiguous: false };
+  }
+
+  if (parsed.cardNumber) {
+    const byNum = cards.filter((c) => cardNumbersMatch(c.cardNumber, parsed.cardNumber));
+    if (byNum.length >= 1) {
+      const chosen = byNum[0];
+      const ambiguous = byNum.length > 1;
+      const reason = ambiguous
+        ? `${byNum.length} Collectr variants for #${parsed.cardNumber} — using first match (add finish in Shopify if needed)`
+        : null;
+      return { card: chosen, reason, ambiguous };
+    }
+  }
+
+  if (cards.length >= 1) {
+    return { card: cards[0], reason: 'No card number on photo — using first Collectr result', ambiguous: true };
+  }
+
+  return { card: null, reason: 'No Collectr results', ambiguous: false };
 }
 
 async function resolveCardFromImage(imageBase64, mimeType = 'image/jpeg') {
@@ -241,5 +279,6 @@ module.exports = {
   searchCollectrFromParsed,
   searchByCardImage,
   pickAutoCollectrCard,
+  pickCardForBulkImport,
   resolveCardFromImage,
 };

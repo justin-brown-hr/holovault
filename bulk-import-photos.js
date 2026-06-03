@@ -1,22 +1,59 @@
 /**
- * bulk-import-photos.js
- * Bulk upload card photos → OpenAI read → Collectr match → Shopify add.
+ * Bulk photo import: read photo → Collectr match → Shopify add OR stock +1.
+ * Fails only when Collectr cannot be matched (missing from Shopify creates a new listing).
  */
 
-const { hasOpenAiKey, parseCardImage, searchCollectrFromParsed, pickAutoCollectrCard } = require('./card-vision');
+const {
+  hasOpenAiKey,
+  parseCardImage,
+  searchCollectrFromParsed,
+  pickCardForBulkImport,
+} = require('./card-vision');
 const { parseCardFromImageOffline } = require('./local-ocr');
 const { searchCards } = require('./collectr');
-const { cardNumbersMatch } = require('./collectr-match');
-const { addOrUpdateProduct, formatShopifyError } = require('./shopify');
+const {
+  addOrUpdateProduct,
+  buildListingIndex,
+  getManagedProductsCached,
+  formatShopifyError,
+  listingKey,
+} = require('./shopify');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function parsePhoto(base64, mimeType, useOpenAi) {
+  if (useOpenAi) {
+    return parseCardImage(base64, mimeType);
+  }
+  const offline = await parseCardFromImageOffline(base64, mimeType);
+  return {
+    name: '',
+    cardNumber: offline.cardNumber || '',
+    setName: '',
+    subType: '',
+    language: 'other',
+    confidence: offline.confidence,
+  };
+}
+
+async function findOnCollectr(parsed, useOpenAi) {
+  if (useOpenAi) {
+    const r = await searchCollectrFromParsed(parsed);
+    return { cards: r.cards, searchMethod: r.searchMethod };
+  }
+  if (!parsed.cardNumber) {
+    return { cards: [], searchMethod: null };
+  }
+  const cards = await searchCards(parsed.cardNumber);
+  return { cards, searchMethod: 'card_number' };
+}
+
 /**
  * @param {Array<{filename?: string, image: string, mimeType?: string}>} photos
  * @param {number} multiplier
- * @param {function} onProgress
+ * @param {function} onProgress — SSE events (start, progress, item, done)
  */
 async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
   const emit = (payload) => {
@@ -31,8 +68,20 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
   if (photos.length > maxPhotos) {
     throw new Error(`Bulk photo import limited to ${maxPhotos} images per batch.`);
   }
-  if (!hasOpenAiKey() && photos.length > maxPhotosOcr) {
-    throw new Error(`Bulk photo import without OpenAI is limited to ${maxPhotosOcr} images per batch.`);
+
+  const useOpenAi = hasOpenAiKey();
+  if (!useOpenAi && photos.length > maxPhotosOcr) {
+    throw new Error(
+      `Bulk photo import without OpenAI is limited to ${maxPhotosOcr} images per batch.`
+    );
+  }
+
+  let listingIndex = null;
+  try {
+    const managed = await getManagedProductsCached();
+    listingIndex = buildListingIndex(managed);
+  } catch (e) {
+    console.warn('[BulkPhoto] Could not preload Shopify listings:', e.message);
   }
 
   const total = photos.length;
@@ -60,76 +109,37 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
     try {
       if (!base64) throw new Error('Empty image data');
 
-      let parsed;
-      let cards;
-      let searchMethod = null;
-      let card = null;
-      let reason = null;
+      const parsed = await parsePhoto(base64, mimeType, useOpenAi);
+      console.log(`[BulkPhoto] ${label} parsed (${useOpenAi ? 'openai' : 'ocr'}):`, parsed);
 
-      if (hasOpenAiKey()) {
-        parsed = await parseCardImage(base64, mimeType);
-        console.log(`[BulkPhoto] ${label} parsed (openai):`, parsed);
-
-        emit({
-          type: 'progress',
-          current,
-          total,
-          filename: label,
-          phase: 'collectr',
-          detail: `#${parsed.cardNumber || '?'} · ${parsed.name || '?'}`,
-          added: results.added,
-          incremented: results.incremented,
-          failed: results.failed,
-        });
-
-        const r = await searchCollectrFromParsed(parsed);
-        cards = r.cards;
-        searchMethod = r.searchMethod;
-        const picked = pickAutoCollectrCard(cards, parsed);
-        card = picked.card;
-        reason = picked.reason;
-      } else {
-        const offline = await parseCardFromImageOffline(base64, mimeType);
-        parsed = {
-          name: '',
-          cardNumber: offline.cardNumber || '',
-          setName: '',
-          subType: '',
-          language: 'other',
-          confidence: offline.confidence,
-        };
-        console.log(`[BulkPhoto] ${label} parsed (ocr):`, parsed, offline.cardNumbers);
-
-        if (!parsed.cardNumber) {
-          throw new Error('Could not read card number from photo (offline OCR)');
-        }
-
-        emit({
-          type: 'progress',
-          current,
-          total,
-          filename: label,
-          phase: 'collectr',
-          detail: `#${parsed.cardNumber}`,
-          added: results.added,
-          incremented: results.incremented,
-          failed: results.failed,
-        });
-
-        cards = await searchCards(parsed.cardNumber);
-        searchMethod = 'card_number';
-        const byNum = (cards || []).filter((c) => cardNumbersMatch(c.cardNumber, parsed.cardNumber));
-        if (byNum.length === 1) {
-          card = byNum[0];
-        } else if (byNum.length === 0) {
-          reason = 'No Collectr match for this card number';
-        } else {
-          reason = `${byNum.length} matches for this number (different finishes) — needs OpenAI or manual search`;
-        }
+      if (!useOpenAi && !parsed.cardNumber) {
+        throw new Error('Could not read card number from photo (offline OCR)');
       }
 
+      emit({
+        type: 'progress',
+        current,
+        total,
+        filename: label,
+        phase: 'collectr',
+        detail: `#${parsed.cardNumber || '?'}${parsed.name ? ` · ${parsed.name}` : ''}`,
+        added: results.added,
+        incremented: results.incremented,
+        failed: results.failed,
+      });
+
+      const { cards, searchMethod } = await findOnCollectr(parsed, useOpenAi);
+      if (!cards?.length) {
+        throw new Error('No match on Collectr — check card number or try a clearer photo');
+      }
+
+      const { card, reason: pickNote } = pickCardForBulkImport(cards, parsed);
       if (!card) {
-        throw new Error(reason || 'No matching Collectr listing');
+        throw new Error(pickNote || 'No matching Collectr listing');
+      }
+
+      if (pickNote) {
+        console.warn(`[BulkPhoto] ${label}: ${pickNote}`);
       }
 
       emit({
@@ -144,7 +154,19 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
         failed: results.failed,
       });
 
-      const shopResult = await addOrUpdateProduct(card, multiplier);
+      const shopResult = await addOrUpdateProduct(card, multiplier, { listingIndex });
+
+      if (listingIndex && card.collectrId) {
+        const key = listingKey(card.collectrId, card.subType);
+        listingIndex.set(key, {
+          productId: shopResult.product?.id,
+          variantId: shopResult.product?.variants?.[0]?.id,
+          title: shopResult.product?.title || card.name,
+          collectrId: String(card.collectrId),
+          subType: card.subType,
+          inventoryQuantity: shopResult.quantity,
+        });
+      }
 
       if (shopResult.incremented) results.incremented++;
       else results.added++;
@@ -155,11 +177,12 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
         total,
         filename: label,
         ok: true,
-        title: card.name,
+        title: shopResult.product?.title || card.name,
         subType: card.subType,
         cardNumber: card.cardNumber,
         searchMethod,
         wasIncrement: !!shopResult.incremented,
+        pickNote: pickNote || undefined,
         added: results.added,
         incremented: results.incremented,
         failed: results.failed,

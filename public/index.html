@@ -1027,7 +1027,7 @@
     const estSec = Math.ceil(files.length * 8);
     if (
       !confirm(
-        `Import ${files.length} photos to Shopify automatically?\n\nEach photo: read card → match Collectr → add listing.\nMultiplier ×${mult}. About ${estSec}s.`
+        `Import ${files.length} photos to Shopify automatically?\n\nEach photo: read card → match Collectr → add new listing or stock +1 if already listed.\nMultiplier ×${mult}. About ${estSec}s.`
       )
     ) {
       return;
