@@ -1055,77 +1055,82 @@
         })
       );
 
-      setProgress({ status: 'Uploading photos…', percent: 2 });
-
-      const res = await fetch('/api/bulk-import-photos?stream=1', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body: JSON.stringify({ photos, multiplier: mult }),
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Bulk photo import failed');
+      const payloadBytes = photos.reduce((n, p) => n + (p.image?.length || 0), 0);
+      if (payloadBytes > 9 * 1024 * 1024) {
+        throw new Error(
+          'Photos are too large for one upload on the server (max ~9 MB total). Try fewer photos per batch.'
+        );
       }
 
-      // uses the outer finalResult
+      setProgress({ status: 'Uploading photos…', percent: 2 });
 
-      await readSseStream(res, (evt) => {
-        if (evt.type === 'start') {
-          setProgress({
-            status: `Processing ${evt.total} photos…`,
-            percent: 0,
-            stats: '0 added · 0 failed',
-            hasFailures: false,
-            errors: [],
-          });
-        } else if (evt.type === 'progress') {
-          const pct = evt.total ? Math.round((evt.current / evt.total) * 100) : 0;
-          const phase =
-            evt.phase === 'parse'
-              ? 'Reading photo…'
-              : evt.phase === 'collectr'
-                ? 'Finding on Collectr…'
-                : 'Adding to Shopify…';
-          setProgress({
-            status: `Photo ${evt.current} of ${evt.total}`,
-            detail: evt.detail || `${phase} ${evt.filename || ''}`,
-            stats: `${(evt.added || 0) + (evt.incremented || 0)} listed · ${evt.failed} failed`,
-            hasFailures: evt.failed > 0,
-            percent: pct,
-          });
-        } else if (evt.type === 'item') {
-          const pct = evt.total ? Math.round((evt.current / evt.total) * 100) : undefined;
-          const listed = (evt.added || 0) + (evt.incremented || 0);
-          setProgress({
-            stats: `${listed} listed · ${evt.failed} failed`,
-            hasFailures: evt.failed > 0,
-            percent: pct,
-            detail: evt.ok
-              ? `✓ ${evt.title || evt.filename}${evt.wasIncrement ? ' (stock +1)' : ''}`
-              : `✗ ${evt.filename}: ${evt.error || 'failed'}`,
-          });
-        } else if (evt.type === 'done') {
-          finalResult = evt;
-          const listed = evt.added + evt.incremented;
+      const startRes = await fetch('/api/bulk-import/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ photos, multiplier: mult }),
+      });
+      const startData = await startRes.json().catch(() => ({}));
+
+      if (!startRes.ok && startRes.status !== 409) {
+        throw new Error(startData.error || 'Bulk photo import failed to start');
+      }
+
+      const jobId = startData.jobId || startData.job?.id;
+      if (!jobId) throw new Error('Bulk import job id missing');
+
+      while (true) {
+        const res = await fetch(`/api/bulk-import/status/${jobId}`);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Bulk import status failed');
+
+        const job = data.job || {};
+        const total = job.total || 0;
+        const current = job.current || 0;
+        const listed = (job.added || 0) + (job.incremented || 0);
+        const pct = total > 0 ? Math.round((current / total) * 100) : job.status === 'done' ? 100 : 2;
+        const phaseLabel =
+          job.phase === 'parse'
+            ? 'Reading photo…'
+            : job.phase === 'collectr'
+              ? 'Finding on Collectr…'
+              : job.phase === 'shopify'
+                ? 'Adding to Shopify…'
+                : '';
+
+        setProgress({
+          status: total > 0 ? `Photo ${Math.min(current, total)} of ${total}` : job.message || 'Starting…',
+          detail: job.detail || (phaseLabel && job.filename ? `${phaseLabel} ${job.filename}` : job.message || ''),
+          stats: `${listed} listed · ${job.failed || 0} failed`,
+          hasFailures: (job.failed || 0) > 0,
+          percent: pct,
+          errors: job.status === 'done' || job.status === 'failed' ? job.errors || [] : null,
+        });
+
+        if (job.status === 'done') {
+          finalResult = {
+            added: job.added || 0,
+            incremented: job.incremented || 0,
+            failed: job.failed || 0,
+            errors: job.errors || [],
+          };
           const msg =
-            evt.failed > 0
-              ? `Done — ${listed} listed, ${evt.failed} failed`
+            finalResult.failed > 0
+              ? `Done — ${listed} listed, ${finalResult.failed} failed`
               : `Done — ${listed} cards added to Shopify`;
           setProgress({
             status: msg,
             percent: 100,
             stats: msg,
-            hasFailures: evt.failed > 0,
-            errors: evt.errors || [],
+            hasFailures: finalResult.failed > 0,
+            errors: finalResult.errors,
           });
-        } else if (evt.type === 'error') {
-          throw new Error(evt.error || 'Bulk photo import failed');
+          break;
         }
-      });
+        if (job.status === 'failed') {
+          throw new Error(job.message || 'Bulk photo import failed');
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
 
       if (finalResult) {
         const listed = finalResult.added + finalResult.incremented;

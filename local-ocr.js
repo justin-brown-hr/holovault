@@ -10,6 +10,29 @@
 const { createWorker } = require('tesseract.js');
 const sharp = require('sharp');
 
+/** Production default: eng only (faster, no extra traineddata downloads on Railway). */
+function getDefaultOcrLang() {
+  if (process.env.OCR_LANG) return process.env.OCR_LANG.trim();
+  if (process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT) return 'eng';
+  return 'eng+chi_sim+jpn';
+}
+
+let preloadPromise = null;
+
+/** Warm OCR on server boot so first bulk photo is not a cold-start timeout. */
+function preloadOcr() {
+  if (preloadPromise) return preloadPromise;
+  preloadPromise = (async () => {
+    const worker = await createWorker(getDefaultOcrLang());
+    await worker.terminate();
+    console.log('[OCR] Ready (' + getDefaultOcrLang() + ')');
+  })().catch((err) => {
+    preloadPromise = null;
+    console.warn('[OCR] Preload skipped:', err.message);
+  });
+  return preloadPromise;
+}
+
 function extractCardNumbers(text) {
   const t = (text || '').replace(/\s+/g, ' ');
   const out = new Set();
@@ -75,7 +98,7 @@ async function ocrImageBase64(imageBase64, mimeType = 'image/jpeg', opts = {}) {
   if (!clean) throw new Error('Empty image data');
   const inputBuf = Buffer.from(clean, 'base64');
 
-  const lang = opts.lang || 'eng+chi_sim+jpn';
+  const lang = opts.lang || getDefaultOcrLang();
   const worker = await createWorker(lang);
   try {
     await worker.setParameters({
@@ -127,8 +150,7 @@ async function ocrImageBase64(imageBase64, mimeType = 'image/jpeg', opts = {}) {
 
 async function parseCardFromImageOffline(imageBase64, mimeType = 'image/jpeg') {
   const attempts = [
-    { whitelist: '0123456789/', lang: 'eng+chi_sim+jpn' },
-    // Very strict: digits and slash only, English model (often better for numbers).
+    { whitelist: '0123456789/', lang: getDefaultOcrLang() },
     { whitelist: '0123456789/', lang: 'eng' },
     // Allow some noise that often appears around the number.
     { whitelist: '0123456789/.-', lang: 'eng' },
@@ -158,5 +180,7 @@ module.exports = {
   pickBestCardNumber,
   ocrImageBase64,
   parseCardFromImageOffline,
+  preloadOcr,
+  getDefaultOcrLang,
 };
 

@@ -27,7 +27,7 @@ const {
 const { syncAllPrices, syncProductById } = require('./sync-prices');
 const { hasOpenAiKey, searchByCardImage } = require('./card-vision');
 const { bulkImportPhotos } = require('./bulk-import-photos');
-const { parseCardFromImageOffline } = require('./local-ocr');
+const { parseCardFromImageOffline, preloadOcr } = require('./local-ocr');
 
 function getConfig() {
   return {
@@ -177,41 +177,160 @@ app.post('/api/add-card', requireToken, async (req, res) => {
   }
 });
 
-app.post('/api/bulk-import-photos', requireToken, async (req, res) => {
+const bulkImportJobs = new Map();
+let activeBulkImportJobId = null;
+
+function applyBulkImportEvent(job, evt) {
+  if (!evt || !job) return;
+  if (evt.type === 'start') {
+    job.total = evt.total || 0;
+    job.current = 0;
+    job.added = 0;
+    job.incremented = 0;
+    job.failed = 0;
+    job.phase = 'running';
+    job.message = `Processing ${job.total} photos…`;
+    return;
+  }
+  if (evt.type === 'progress') {
+    if (evt.current != null) job.current = evt.current;
+    if (evt.total != null) job.total = evt.total;
+    if (evt.added != null) job.added = evt.added;
+    if (evt.incremented != null) job.incremented = evt.incremented;
+    if (evt.failed != null) job.failed = evt.failed;
+    job.phase = evt.phase || job.phase;
+    job.filename = evt.filename || job.filename;
+    job.detail = evt.detail || job.detail;
+    job.message =
+      evt.current != null && evt.total != null
+        ? `Photo ${evt.current} of ${evt.total}`
+        : job.message;
+    return;
+  }
+  if (evt.type === 'item') {
+    if (evt.current != null) job.current = evt.current;
+    if (evt.added != null) job.added = evt.added;
+    if (evt.incremented != null) job.incremented = evt.incremented;
+    if (evt.failed != null) job.failed = evt.failed;
+    if (!evt.ok) {
+      job.errors.push({ filename: evt.filename || 'Photo', error: evt.error || 'Failed' });
+    }
+    job.detail = evt.ok
+      ? `✓ ${evt.title || evt.filename || ''}${evt.wasIncrement ? ' (stock +1)' : ''}`
+      : `✗ ${evt.filename || ''}: ${evt.error || 'failed'}`;
+    return;
+  }
+  if (evt.type === 'done') {
+    job.status = 'done';
+    job.phase = 'done';
+    job.added = evt.added ?? job.added;
+    job.incremented = evt.incremented ?? job.incremented;
+    job.failed = evt.failed ?? job.failed;
+    job.errors = Array.isArray(evt.errors) ? evt.errors : job.errors;
+    const listed = job.added + job.incremented;
+    job.message =
+      job.failed > 0
+        ? `Done — ${listed} listed, ${job.failed} failed`
+        : `Done — ${listed} cards on Shopify`;
+    job.detail = '';
+    job.finishedAt = new Date().toISOString();
+  }
+}
+
+function startBulkImportJob(photos, multiplier) {
+  const id = `bulk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    id,
+    status: 'running',
+    phase: 'starting',
+    message: 'Starting…',
+    total: photos.length,
+    current: 0,
+    added: 0,
+    incremented: 0,
+    failed: 0,
+    filename: '',
+    detail: '',
+    errors: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+  };
+  bulkImportJobs.set(id, job);
+  activeBulkImportJobId = id;
+
+  (async () => {
+    try {
+      await bulkImportPhotos(photos, multiplier, (evt) => applyBulkImportEvent(job, evt));
+      if (job.status !== 'done') {
+        job.status = 'done';
+        job.phase = 'done';
+        job.finishedAt = new Date().toISOString();
+      }
+    } catch (err) {
+      console.error('Bulk import job error:', err.message);
+      job.status = 'failed';
+      job.phase = 'failed';
+      job.message = err.message || 'Bulk import failed';
+      job.errors.push({ filename: 'Bulk import', error: job.message });
+      job.finishedAt = new Date().toISOString();
+    } finally {
+      if (activeBulkImportJobId === job.id) activeBulkImportJobId = null;
+    }
+  })();
+
+  return job;
+}
+
+app.post('/api/bulk-import/start', requireToken, async (req, res) => {
   const { photos, multiplier } = req.body || {};
   const { sync } = getConfig();
   const mult = parseFloat(multiplier) || sync.defaultMultiplier;
-  const useStream =
-    req.query.stream === '1' || String(req.headers.accept || '').includes('text/event-stream');
 
   if (!Array.isArray(photos) || photos.length === 0) {
     return res.status(400).json({ error: 'Send { photos: [{ image, mimeType, filename }] }.' });
   }
 
-  if (!useStream) {
-    try {
-      const results = await bulkImportPhotos(photos, mult);
-      res.json({ success: true, ...results });
-    } catch (err) {
-      console.error('Bulk photo import error:', err.message);
-      res.status(500).json({ error: err.message });
+  if (activeBulkImportJobId) {
+    const running = bulkImportJobs.get(activeBulkImportJobId);
+    if (running && running.status === 'running') {
+      return res.status(409).json({
+        success: false,
+        error: 'A bulk photo import is already running.',
+        jobId: running.id,
+        job: running,
+      });
     }
-    return;
   }
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  if (res.flushHeaders) res.flushHeaders();
+  const job = startBulkImportJob(photos, mult);
+  res.json({ success: true, jobId: job.id, job });
+});
+
+app.get('/api/bulk-import/status/:id', requireToken, async (req, res) => {
+  const job = bulkImportJobs.get(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'Bulk import job not found' });
+  }
+  res.json({ success: true, job });
+});
+
+/** @deprecated Use POST /api/bulk-import/start + poll /api/bulk-import/status/:id (SSE breaks on Railway). */
+app.post('/api/bulk-import-photos', requireToken, async (req, res) => {
+  const { photos, multiplier } = req.body || {};
+  const { sync } = getConfig();
+  const mult = parseFloat(multiplier) || sync.defaultMultiplier;
+
+  if (!Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: 'Send { photos: [{ image, mimeType, filename }] }.' });
+  }
 
   try {
-    await bulkImportPhotos(photos, mult, (event) => writeSse(res, event));
+    const results = await bulkImportPhotos(photos, mult);
+    res.json({ success: true, ...results });
   } catch (err) {
-    console.error('Bulk photo stream error:', err.message);
-    writeSse(res, { type: 'error', error: err.message });
+    console.error('Bulk photo import error:', err.message);
+    res.status(500).json({ error: err.message });
   }
-  res.end();
 });
 
 app.post('/api/bulk-add', requireToken, async (req, res) => {
@@ -494,6 +613,7 @@ app.listen(PORT, async () => {
       console.log('⚠️  Shopify auth failed:', err.message);
     }
   }
+  preloadOcr();
 });
 
 process.on('SIGINT', async () => {
