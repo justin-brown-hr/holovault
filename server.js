@@ -23,6 +23,7 @@ const {
   getAuthMode,
   getAuthStatus,
   ensureAccessToken,
+  warnMissingShopifyScopes,
 } = require('./shopify');
 const { syncAllPrices, syncProductById } = require('./sync-prices');
 const { hasOpenAiKey, searchByCardImage } = require('./card-vision');
@@ -747,6 +748,7 @@ app.listen(PORT, async () => {
       const auth = getAuthStatus();
       if (auth.mode === 'client_credentials') {
         console.log(`✓ Shopify auth: client credentials (auto-refresh), scopes: ${auth.scopes || '—'}`);
+        warnMissingShopifyScopes(auth.scopes);
         if (auth.expiresInHours != null) {
           console.log(`  Token valid ~${auth.expiresInHours}h (refreshes automatically before expiry)`);
         }

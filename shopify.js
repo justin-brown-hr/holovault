@@ -260,37 +260,14 @@ async function getStockMetafield(productId) {
 }
 
 async function setStockMetafield(productId, quantity) {
-  const pid = normalizeLegacyResourceId(productId);
-  if (!pid) return Math.max(0, quantity);
-  const qty = Math.max(0, quantity);
-  const { client } = await getClient();
-  const mutation = `
-    mutation StockQtySet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        userErrors { field message }
-      }
-    }
-  `;
+  const productGid = toGid('Product', productId);
+  if (!productGid) return Math.max(0, quantity);
   try {
-    const data = await shopifyGraphql(client, mutation, {
-      metafields: [
-        {
-          ownerId: `gid://shopify/Product/${pid}`,
-          namespace: 'custom',
-          key: 'stock_qty',
-          type: 'number_integer',
-          value: String(qty),
-        },
-      ],
-    });
-    const errors = data?.metafieldsSet?.userErrors;
-    if (errors?.length) {
-      console.warn('[Shopify] stock_qty metafield:', errors.map((e) => e.message).join('; '));
-    }
+    return await setStockMetafieldGraphql(productGid, quantity);
   } catch (err) {
     console.warn('[Shopify] stock_qty metafield failed:', formatShopifyError(err));
+    return Math.max(0, quantity);
   }
-  return qty;
 }
 
 async function enableInventoryTracking(variantId) {
@@ -398,7 +375,9 @@ function formatSubTypeForStore(subType) {
 
 async function setProductMetafields(productId, card, multiplier) {
   const { client } = await getClient();
-  const ownerId = `gid://shopify/Product/${productId}`;
+  const ownerId = String(productId).startsWith('gid://')
+    ? productId
+    : `gid://shopify/Product/${normalizeLegacyResourceId(productId)}`;
   const finish = formatSubTypeForStore(card.subType);
 
   const metafields = [
@@ -548,6 +527,139 @@ function legacyId(gidOrId) {
   return m ? m[1] : s;
 }
 
+function toGid(resource, id) {
+  if (id == null || id === '') return null;
+  const s = String(id).trim();
+  if (s.startsWith('gid://')) return s;
+  const num = normalizeLegacyResourceId(s);
+  return num ? `gid://shopify/${resource}/${num}` : null;
+}
+
+let cachedLocationGid = null;
+
+async function getPrimaryLocationGid() {
+  if (cachedLocationGid) return cachedLocationGid;
+  const locationId = await getPrimaryLocationId();
+  if (!locationId) return null;
+  cachedLocationGid = `gid://shopify/Location/${locationId}`;
+  return cachedLocationGid;
+}
+
+async function setInventoryQuantityGraphql(listing, quantity) {
+  const inventoryItemGid =
+    listing.inventoryItemGid || toGid('InventoryItem', listing.inventoryItemId);
+  const locationGid = await getPrimaryLocationGid();
+  if (!inventoryItemGid || !locationGid) {
+    throw new Error('Missing inventory item or location for stock update');
+  }
+
+  const { client } = await getClient();
+  const mutation = `
+    mutation InvSet($input: InventorySetOnHandQuantitiesInput!) {
+      inventorySetOnHandQuantities(input: $input) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphql(client, mutation, {
+    input: {
+      reason: 'correction',
+      setQuantities: [
+        {
+          inventoryItemId: inventoryItemGid,
+          locationId: locationGid,
+          quantity: Math.max(0, quantity),
+        },
+      ],
+    },
+  });
+  const errors = data?.inventorySetOnHandQuantities?.userErrors;
+  if (errors?.length) {
+    throw new Error(errors.map((e) => e.message).join('; '));
+  }
+  return Math.max(0, quantity);
+}
+
+async function setStockMetafieldGraphql(productGid, quantity) {
+  const ownerId = productGid?.startsWith('gid://')
+    ? productGid
+    : toGid('Product', productGid);
+  if (!ownerId) return Math.max(0, quantity);
+
+  const qty = Math.max(0, quantity);
+  const { client } = await getClient();
+  const mutation = `
+    mutation StockQtySet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphql(client, mutation, {
+    metafields: [
+      {
+        ownerId,
+        namespace: 'custom',
+        key: 'stock_qty',
+        type: 'number_integer',
+        value: String(qty),
+      },
+    ],
+  });
+  const errors = data?.metafieldsSet?.userErrors;
+  if (errors?.length) {
+    throw new Error(errors.map((e) => e.message).join('; '));
+  }
+  return qty;
+}
+
+async function updateProductPriceGraphql(listing, card, multiplier = 1.0, usdRate = null) {
+  const productGid = listing.productGid || toGid('Product', listing.productId);
+  const variantGid = listing.variantGid || toGid('ProductVariant', listing.variantId);
+  if (!productGid || !variantGid) {
+    throw new Error('Missing product/variant GID for price update');
+  }
+
+  const rate = usdRate ?? (await getUsdToNzdRate());
+  const finalPrice = (card.price * multiplier * rate).toFixed(2);
+  const { client } = await getClient();
+  const mutation = `
+    mutation VariantPrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphql(client, mutation, {
+    productId: productGid,
+    variants: [{ id: variantGid, price: finalPrice }],
+  });
+  const errors = data?.productVariantsBulkUpdate?.userErrors;
+  if (errors?.length) {
+    throw new Error(errors.map((e) => e.message).join('; '));
+  }
+
+  await setProductMetafields(productGid, card, multiplier);
+  return finalPrice;
+}
+
+function warnMissingShopifyScopes(scopes) {
+  const required = [
+    'write_products',
+    'read_products',
+    'write_inventory',
+    'read_inventory',
+    'read_locations',
+  ];
+  const have = new Set((scopes || '').split(/[,\s]+/).filter(Boolean));
+  const missing = required.filter((s) => !have.has(s));
+  if (!missing.length) return;
+  console.warn(`⚠️  Missing Shopify API scopes: ${missing.join(', ')}`);
+  console.warn(
+    '   Shopify Dev Dashboard → App → Versions → Access scopes → add missing scopes → Release → redeploy Railway.'
+  );
+}
+
 /** Collectr uses one product_id per finish; Foil and Normal share an id but differ by subType. */
 function normalizeSubType(subType) {
   return (subType || '')
@@ -610,8 +722,11 @@ function nodeToExistingListing(node, collectrId) {
 
   return {
     productId: node.legacyResourceId,
+    productGid: node.id,
     variantId: variant?.legacyResourceId,
+    variantGid: variant?.id,
     inventoryItemId: legacyId(variant?.inventoryItem?.id),
+    inventoryItemGid: variant?.inventoryItem?.id || null,
     inventoryManagement: variant?.inventoryItem ? 'shopify' : null,
     inventoryQuantity: variant?.inventoryQuantity ?? null,
     title: node.title,
@@ -658,11 +773,13 @@ async function findExistingListingGraphql(card) {
       products(first: 25, query: $query) {
         edges {
           node {
+            id
             legacyResourceId
             title
             variants(first: 1) {
               edges {
                 node {
+                  id
                   legacyResourceId
                   inventoryQuantity
                   inventoryItem { id }
@@ -699,60 +816,63 @@ async function findProductByCollectrId(collectrId) {
 
 /**
  * Add stock to an existing listing (same Collectr product_id).
+ * Uses GraphQL first (works with write_products + write_inventory on Railway).
  */
 async function incrementProductStock(existing, card, multiplier = 1.0, options = {}) {
   const { skipCollection = false, skipCacheInvalidate = false, usdRate = null } = options;
-  const { client } = await getClient();
-  const useInventory = await checkInventoryApiAccess();
-  let newQty;
   let warning = null;
 
-  const productId = normalizeLegacyResourceId(existing.productId);
-  const variantId = normalizeLegacyResourceId(existing.variantId);
-  const listing = { ...existing, productId, variantId };
-
-  if (useInventory) {
-    let inventoryItemId = normalizeInventoryItemId(listing.inventoryItemId);
-
-    if (!inventoryItemId) {
-      inventoryItemId = await resolveInventoryItemId(client, productId, variantId);
-    } else if (listing.inventoryManagement !== 'shopify' && variantId) {
-      try {
-        await enableInventoryTracking(variantId);
-        inventoryItemId = await resolveInventoryItemId(client, productId, variantId);
-      } catch (err) {
-        console.warn('[Shopify] Enable inventory tracking skipped:', formatShopifyError(err));
-      }
+  let listing = { ...existing };
+  if (!listing.productGid || !listing.variantGid) {
+    try {
+      const fresh = await findExistingListingGraphql(card);
+      if (fresh) listing = { ...listing, ...fresh };
+    } catch (err) {
+      console.warn('[Shopify] GraphQL listing refresh skipped:', formatShopifyError(err));
     }
+  }
 
-    if (inventoryItemId) {
-      try {
-        const currentQty = await getInventoryQuantity(inventoryItemId);
-        newQty = currentQty + 1;
-        await setInventoryQuantity(inventoryItemId, newQty);
-      } catch (err) {
-        console.warn('[Shopify] Inventory bump failed, using stock metafield:', formatShopifyError(err));
-        const currentQty = await getStockMetafield(productId);
-        newQty = currentQty + 1;
-        await setStockMetafield(productId, newQty);
-        warning = STOCK_SCOPE_HINT;
-      }
-    } else {
-      const currentQty = await getStockMetafield(productId);
-      newQty = currentQty + 1;
-      await setStockMetafield(productId, newQty);
+  listing.productId = normalizeLegacyResourceId(listing.productId);
+  listing.variantId = normalizeLegacyResourceId(listing.variantId);
+  listing.productGid = listing.productGid || toGid('Product', listing.productId);
+  listing.variantGid = listing.variantGid || toGid('ProductVariant', listing.variantId);
+  listing.inventoryItemGid =
+    listing.inventoryItemGid || toGid('InventoryItem', listing.inventoryItemId);
+
+  const currentQty =
+    listing.inventoryQuantity != null
+      ? Number(listing.inventoryQuantity)
+      : await getStockMetafield(listing.productId);
+  const newQty = (Number.isFinite(currentQty) ? currentQty : 0) + 1;
+
+  let stockUpdated = false;
+  if (listing.inventoryItemGid) {
+    try {
+      await setInventoryQuantityGraphql(listing, newQty);
+      stockUpdated = true;
+    } catch (err) {
+      console.warn('[Shopify] GraphQL inventory bump failed:', formatShopifyError(err));
+    }
+  }
+
+  if (!stockUpdated && listing.productGid) {
+    try {
+      await setStockMetafieldGraphql(listing.productGid, newQty);
+      stockUpdated = true;
       warning = STOCK_SCOPE_HINT;
+    } catch (err) {
+      console.warn('[Shopify] GraphQL stock metafield failed:', formatShopifyError(err));
+      throw new Error(formatShopifyError(err));
     }
-  } else {
-    const currentQty = await getStockMetafield(productId);
-    newQty = currentQty + 1;
-    await setStockMetafield(productId, newQty);
-    warning = STOCK_SCOPE_HINT;
+  }
+
+  if (!stockUpdated) {
+    throw new Error('Could not update stock — product GID missing. Check Shopify app scopes.');
   }
 
   let finalPrice = null;
   try {
-    finalPrice = await updateProductPrice(productId, variantId, card, multiplier, usdRate);
+    finalPrice = await updateProductPriceGraphql(listing, card, multiplier, usdRate);
   } catch (err) {
     console.warn('[Shopify] Price update skipped on stock increment:', formatShopifyError(err));
     warning = warning || formatShopifyError(err);
@@ -773,28 +893,17 @@ async function incrementProductStock(existing, card, multiplier = 1.0, options =
     }
   }
 
-  let updated = null;
-  try {
-    const res = await client.get(`/products/${productId}.json`);
-    updated = res.data.product;
-  } catch (err) {
-    console.warn('[Shopify] Product refresh skipped after increment:', formatShopifyError(err));
-    updated = {
-      id: productId,
-      title: listing.title,
-      variants: variantId ? [{ id: variantId, inventory_quantity: newQty }] : [],
-    };
-  }
+  const updated = {
+    id: listing.productId,
+    title: listing.title,
+    variants: listing.variantId
+      ? [{ id: listing.variantId, inventory_quantity: newQty }]
+      : [],
+  };
 
-  const variant = updated.variants?.[0];
   cacheCollectrListing(card, {
     ...listing,
-    productId: updated.id || productId,
-    variantId: variant?.id || variantId,
-    inventoryItemId:
-      normalizeInventoryItemId(variant?.inventory_item_id) || listing.inventoryItemId,
     inventoryQuantity: newQty,
-    title: updated.title || listing.title,
     subType: card.subType || listing.subType,
   });
 
@@ -1073,6 +1182,7 @@ async function getManagedProducts() {
         pageInfo { hasNextPage endCursor }
         edges {
           node {
+            id
             legacyResourceId
             title
             createdAt
@@ -1081,6 +1191,7 @@ async function getManagedProducts() {
             variants(first: 1) {
               edges {
                 node {
+                  id
                   legacyResourceId
                   price
                   inventoryQuantity
@@ -1128,8 +1239,11 @@ async function getManagedProducts() {
 
       result.push({
         productId: node.legacyResourceId,
+        productGid: node.id,
         variantId: variant?.legacyResourceId,
+        variantGid: variant?.id,
         inventoryItemId: legacyId(variant?.inventoryItem?.id),
+        inventoryItemGid: variant?.inventoryItem?.id || null,
         inventoryManagement: variant?.inventoryItem?.id ? 'shopify' : null,
         inventoryQuantity,
         title: node.title,
@@ -1262,6 +1376,7 @@ module.exports = {
   slugifyTag,
   formatShopifyError,
   checkInventoryApiAccess,
+  warnMissingShopifyScopes,
   STOCK_SCOPE_HINT,
   hasShopifyCredentials,
   getAuthMode,

@@ -54,10 +54,12 @@ If the repo does not appear:
 
 **Bulk photo import fails on Railway but works locally?**
 
-1. Redeploy after the latest `main` — bulk import uses **background job + polling** (not SSE), same fix as price sync.
-2. Bulk import sends **one photo per request** (up to **100** per session by default) — no 10-photo batch limit.
-3. Check **Deployments → Logs** for `[BulkPhoto]` or `[OCR]` errors.
-4. Optional: `OCR_LANG=eng` (default in production).
+1. Check Railway logs for scopes on startup. You need **all** of:
+   `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_locations`
+   Your logs showed only `write_inventory,read_locations,write_products` — that causes **Not Found** and **Owner does not exist** errors.
+2. **Fix scopes:** Shopify Dev Dashboard → your app → **Versions** → **Access scopes** → add `read_products` and `read_inventory` → **Release** → redeploy Railway (no code change needed for scopes alone).
+3. Redeploy latest `main` — stock increment now uses **GraphQL** (works better with client-credentials tokens).
+4. Bulk import sends **one photo per request** (up to **100** per session by default).
 
 ### 4. Deploy
 
