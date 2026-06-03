@@ -15,6 +15,8 @@ const {
   addOrUpdateProduct,
   buildListingIndex,
   getManagedProductsCached,
+  ensureHomepageCollections,
+  invalidateManagedProductsCache,
   formatShopifyError,
   listingKey,
 } = require('./shopify');
@@ -207,6 +209,13 @@ async function bulkImportPhotos(photos, multiplier = 1.0, onProgress) {
         failed: results.failed,
       });
     }
+  }
+
+  try {
+    await ensureHomepageCollections();
+    invalidateManagedProductsCache();
+  } catch (e) {
+    console.warn('[BulkPhoto] Homepage collections refresh skipped:', e.message);
   }
 
   emit({
