@@ -60,6 +60,7 @@ If the repo does not appear:
 2. **Fix scopes:** Shopify Dev Dashboard → your app → **Versions** → **Access scopes** → add `read_products` and `read_inventory` → **Release** → redeploy Railway (no code change needed for scopes alone).
 3. Redeploy latest `main` — stock increment now uses **GraphQL** (works better with client-credentials tokens).
 4. Bulk import sends **one photo per request** (up to **100** per session by default).
+5. **Playwright is optional** on Railway — Collectr search uses HTTP + zero-padded card numbers (`43/86` → `043/086`). You do **not** need `npx playwright install` on Railway unless you want the browser fallback locally.
 
 ### 4. Deploy
 

@@ -10,6 +10,7 @@ const axios = require('axios');
 const { normalizeSubType, pickMatchingCard } = require('./collectr-match');
 
 const COLLECTR_BASE = 'https://app.getcollectr.com';
+let playwrightUnavailable = false;
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -17,20 +18,53 @@ const HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
+function padCardNumberQuery(query) {
+  const m = String(query || '').trim().match(/^(\d{1,4})\s*\/\s*(\d{2,4})$/);
+  if (!m) return null;
+  const left = m[1].padStart(3, '0');
+  const right = m[2].padStart(3, '0');
+  return `${left}/${right}`;
+}
+
+/** e.g. 43/86 → [43/86, 043/086] for Collectr search */
+function searchQueriesFor(query) {
+  const q = String(query || '').trim();
+  if (!q) return [];
+  const out = [q];
+  const padded = padCardNumberQuery(q);
+  if (padded && padded !== q) out.push(padded);
+  return [...new Set(out)];
+}
+
+async function fetchCardsForQuery(query) {
+  const url = `${COLLECTR_BASE}/?query=${encodeURIComponent(query)}`;
+  console.log(`[Collectr] Fetching: ${url}`);
+  const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
+  return extractCardsFromHtml(res.data);
+}
+
 async function searchCardsViaBrowser(query) {
-  // Collectr now renders client-side for some requests. Use Playwright to execute JS
-  // and capture the JSON response that contains product_id / card_number fields.
+  if (playwrightUnavailable) return [];
+
+  // Optional local fallback when Collectr HTML has no embedded data.
   let chromium;
   try {
     ({ chromium } = require('playwright'));
   } catch (e) {
-    throw new Error(
-      'Collectr search requires Playwright. Run: npm install playwright && npx playwright install chromium'
-    );
+    console.warn('[Collectr] Playwright not installed — browser fallback skipped');
+    return [];
   }
 
   const url = `${COLLECTR_BASE}/?query=${encodeURIComponent(query)}`;
-  const browser = await chromium.launch({ headless: true });
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (err) {
+    playwrightUnavailable = true;
+    console.warn('[Collectr] Playwright browsers missing — run: npx playwright install chromium');
+    console.warn('[Collectr]', err.message);
+    return [];
+  }
   const page = await browser.newPage();
 
   let products = null;
@@ -93,47 +127,36 @@ async function searchCardsViaBrowser(query) {
     }
   });
 
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-  // give XHR a moment after networkidle
-  await page.waitForTimeout(1500);
-  await browser.close();
+  try {
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(1500);
+  } finally {
+    await browser.close();
+  }
 
   if (!products) {
     return [];
   }
-  console.log(`[Collectr] Found ${products.length} products (browser)`); // keep same log style
+  console.log(`[Collectr] Found ${products.length} products (browser)`);
   return products.map(normalizeProduct);
 }
 
 /**
- * Search for cards on Collectr by name.
+ * Search for cards on Collectr by name or card number.
+ * Uses HTTP first (works on Railway). Playwright is optional local fallback only.
  */
 async function searchCards(query) {
-  const url = `${COLLECTR_BASE}/?query=${encodeURIComponent(query)}`;
-  console.log(`[Collectr] Fetching: ${url}`);
+  const queries = searchQueriesFor(query);
+  if (!queries.length) return [];
 
-  const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
-  const cards = extractCardsFromHtml(res.data);
-  if (cards.length) return cards;
-  // CSR fallback
-  const viaBrowser = await searchCardsViaBrowser(query);
-  if (viaBrowser.length) return viaBrowser;
+  for (const q of queries) {
+    const cards = await fetchCardsForQuery(q);
+    if (cards.length) return cards;
+  }
 
-  // Collectr often expects leading zeros for set-style numbers (e.g. 043/086).
-  const m = String(query || '').trim().match(/^(\d{1,3})\s*\/\s*(\d{2,3})$/);
-  if (m) {
-    const left = m[1].padStart(3, '0');
-    const right = m[2].padStart(3, '0');
-    const padded = `${left}/${right}`;
-    if (padded !== query) {
-      const paddedUrl = `${COLLECTR_BASE}/?query=${encodeURIComponent(padded)}`;
-      console.log(`[Collectr] Retrying with zeros: ${paddedUrl}`);
-      const res2 = await axios.get(paddedUrl, { headers: HEADERS, timeout: 15000 });
-      const cards2 = extractCardsFromHtml(res2.data);
-      if (cards2.length) return cards2;
-      const viaBrowser2 = await searchCardsViaBrowser(padded);
-      if (viaBrowser2.length) return viaBrowser2;
-    }
+  for (const q of queries) {
+    const viaBrowser = await searchCardsViaBrowser(q);
+    if (viaBrowser.length) return viaBrowser;
   }
 
   return [];

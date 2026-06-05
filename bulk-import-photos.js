@@ -27,11 +27,20 @@ function sleep(ms) {
 }
 
 async function resolveOcrWithCollectr(offline) {
-  const candidates = rankCardNumberCandidates([
+  const raw = [
     ...(offline.rankedCandidates || []),
     ...(offline.cardNumbers || []),
     ...(offline.cardNumber ? [offline.cardNumber] : []),
-  ]);
+  ];
+  const candidates = rankCardNumberCandidates(raw);
+  // CRI OCR often reads 43/86 — Collectr wants 043/086
+  for (const n of [...raw]) {
+    const m = String(n).match(/^(\d{1,3})\/86$/);
+    if (m) {
+      const padded = `${m[1].padStart(3, '0')}/086`;
+      if (!candidates.includes(padded)) candidates.push(padded);
+    }
+  }
 
   for (const cardNumber of candidates) {
     // eslint-disable-next-line no-await-in-loop
