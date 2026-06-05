@@ -1,31 +1,58 @@
 /**
  * local-ocr.js
- * OCR (offline) to extract card number from an image.
+ * OCR (offline) to extract card number from a photo.
  *
- * Goal: no OpenAI key required. We read text and try to find patterns like:
- * - 125/159
- * - 0102/09
+ * Tuned for Pokémon CRI (Crimson Invasion) style numbers: 0xx/086 at bottom-left.
  */
 
 const { createWorker } = require('tesseract.js');
 const sharp = require('sharp');
 
-/** Production default: eng only (faster, no extra traineddata downloads on Railway). */
+/** Card numbers are digits — always use English traineddata (fast, reliable). */
 function getDefaultOcrLang() {
   if (process.env.OCR_LANG) return process.env.OCR_LANG.trim();
-  if (process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT) return 'eng';
-  return 'eng+chi_sim+jpn';
+  return 'eng';
+}
+
+/** CRI set size — most sample photos are CRI EN 0xx/086. */
+const CRI_SET_TOTAL = 86;
+
+const COMMON_SET_TOTALS = ['86', '96', '102', '159', '189', '193', '217', '264', '271', '288'];
+const THREE_DIGIT_TOTALS = ['086', '096', '102', '159', '189', '193', '217', '264', '271', '288'];
+
+function isFourTwo(s) {
+  return /^\d{4}\/\d{2}$/.test(s);
 }
 
 let preloadPromise = null;
+let sharedWorker = null;
+let sharedWorkerLang = null;
 
-/** Warm OCR on server boot so first bulk photo is not a cold-start timeout. */
+async function getSharedWorker(lang = 'eng') {
+  if (sharedWorker && sharedWorkerLang === lang) return sharedWorker;
+  if (sharedWorker) {
+    await sharedWorker.terminate();
+    sharedWorker = null;
+    sharedWorkerLang = null;
+  }
+  sharedWorker = await createWorker(lang);
+  sharedWorkerLang = lang;
+  return sharedWorker;
+}
+
+async function terminateSharedWorker() {
+  if (sharedWorker) {
+    await sharedWorker.terminate();
+    sharedWorker = null;
+    sharedWorkerLang = null;
+  }
+}
+
 function preloadOcr() {
   if (preloadPromise) return preloadPromise;
   preloadPromise = (async () => {
-    const worker = await createWorker(getDefaultOcrLang());
-    await worker.terminate();
-    console.log('[OCR] Ready (' + getDefaultOcrLang() + ')');
+    await getSharedWorker(getDefaultOcrLang());
+    console.log('[OCR] Ready (' + getDefaultOcrLang() + ', CRI-tuned)');
   })().catch((err) => {
     preloadPromise = null;
     console.warn('[OCR] Preload skipped:', err.message);
@@ -33,154 +60,368 @@ function preloadOcr() {
   return preloadPromise;
 }
 
-function extractCardNumbers(text) {
-  const t = (text || '').replace(/\s+/g, ' ');
-  const out = new Set();
+function isCopyrightYear(n) {
+  return n >= 1990 && n <= 2039;
+}
 
-  // Standard: 1-3 digits / 1-3 digits
-  for (const m of t.matchAll(/(\d{1,3})\s*\/\s*(\d{1,3})/g)) {
-    out.add(`${parseInt(m[1], 10)}/${parseInt(m[2], 10)}`);
+function isPlausibleCardNumber(s) {
+  if (!s || typeof s !== 'string') return false;
+  if (isFourTwo(s)) return true;
+
+  const parts = s.split('/');
+  if (parts.length !== 2) return false;
+  const a = parseInt(parts[0], 10);
+  const b = parseInt(parts[1], 10);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a < 1 || b < 1) return false;
+  if (isCopyrightYear(a) || isCopyrightYear(b)) return false;
+  if (a > 400) return false;
+  if (a > b && b < 50) return false;
+  if (b < 9) return false;
+  if (b <= 20 && a <= 9) return false;
+  return true;
+}
+
+function isCriCardNumber(s) {
+  if (!isPlausibleCardNumber(s)) return false;
+  const [a, b] = s.split('/').map((x) => parseInt(x, 10));
+  return b === CRI_SET_TOTAL && a >= 1 && a <= CRI_SET_TOTAL;
+}
+
+function scoreCardNumber(s) {
+  if (!isPlausibleCardNumber(s)) return -100;
+  const [a, b] = s.split('/').map((x) => parseInt(x, 10));
+  let score = 0;
+
+  // Strong CRI preference: 1–86 / 86
+  if (b === CRI_SET_TOTAL) {
+    score += 30;
+    if (a >= 1 && a <= CRI_SET_TOTAL) score += 15;
   }
 
-  // Special: 4 digits / 2 digits (Gem Pack style like 0102/09)
-  for (const m of t.matchAll(/(\d{4})\s*\/\s*(\d{2})/g)) {
-    const left = m[1];
-    const right = m[2];
-    out.add(`${left}/${right}`);
+  if (COMMON_SET_TOTALS.includes(String(b))) score += 8;
+  if (b >= 30 && b <= 400) score += 3;
+  if (a >= 1 && a <= b) score += 6;
+  if (a <= 200) score += 2;
+
+  // Penalize copyright / glare misreads
+  if (b === 202 || b === 2026 || a === 2026) score -= 40;
+  if (b !== CRI_SET_TOTAL && b < 50) score -= 15;
+  if (b <= 20) score -= 20;
+  if (a > b) score -= 15;
+  if (isCopyrightYear(a)) score -= 35;
+  if (a > 999) score -= 25;
+
+  return score;
+}
+
+/** Pull CRI numbers from digit runs: 04370861 → 43/86, 013086 → 13/86 */
+function extractCriFromDigits(text) {
+  const out = new Set();
+  const compact = (text || '').replace(/[^\d]/g, '');
+
+  // ...086 anywhere in stream (OCR often drops the slash)
+  let idx = 0;
+  while ((idx = compact.indexOf('086', idx)) !== -1) {
+    const before = compact.slice(Math.max(0, idx - 8), idx);
+    for (const len of [3, 2, 1]) {
+      if (before.length < len) continue;
+      const a = parseInt(before.slice(-len), 10);
+      if (a >= 1 && a <= CRI_SET_TOTAL) out.add(`${a}/${CRI_SET_TOTAL}`);
+    }
+    idx += 1;
+  }
+
+  // Token blobs: 043708650, 06870865
+  const tokens = (text || '').replace(/\s+/g, ' ').split(/\s+/).filter(Boolean);
+  for (const tok of tokens) {
+    const blob = tok.replace(/[^\d]/g, '');
+    if (blob.length < 5 || blob.length > 14) continue;
+
+    const m086 = blob.match(/^(\d{3})\d{0,5}086/);
+    if (m086) {
+      const a = parseInt(m086[1], 10);
+      if (a >= 1 && a <= CRI_SET_TOTAL) out.add(`${a}/${CRI_SET_TOTAL}`);
+    }
+    const m86 = blob.match(/^(\d{2,3})\d{0,6}86$/);
+    if (m86) {
+      const a = parseInt(m86[1], 10);
+      if (a >= 1 && a <= CRI_SET_TOTAL) out.add(`${a}/${CRI_SET_TOTAL}`);
+    }
+  }
+
+  // Spaced fragments: "0 43" → 043, "3 2" → 32
+  const spaced = (text || '').match(/(?:\d\s+){1,6}\d/g) || [];
+  for (const chunk of spaced) {
+    const digits = chunk.replace(/\s/g, '');
+    if (digits.length >= 2 && digits.length <= 3) {
+      const a = parseInt(digits, 10);
+      if (a >= 1 && a <= CRI_SET_TOTAL) out.add(`${a}/${CRI_SET_TOTAL}`);
+    }
+  }
+
+  // Single-digit runs in footer OCR: "4 0 1 3" → 013, 040, 401...
+  const singles = (text || '').match(/(?:\b\d\b\s*){3,6}/g) || [];
+  for (const run of singles) {
+    const digits = run.replace(/\s/g, '').slice(0, 3);
+    if (digits.length === 3) {
+      const a = parseInt(digits, 10);
+      if (a >= 1 && a <= CRI_SET_TOTAL) out.add(`${a}/${CRI_SET_TOTAL}`);
+    }
   }
 
   return [...out];
 }
 
-function pickBestCardNumber(candidates) {
-  if (!candidates?.length) return '';
+function extractCardNumbers(text) {
+  const t = (text || '').replace(/\s+/g, ' ');
+  const out = new Set();
 
-  // Prefer 4/2 (0102/09) style first, then standard.
-  const isFourTwo = (s) => /^\d{4}\/\d{2}$/.test(s);
-  const isStd = (s) => /^\d{1,3}\/\d{1,3}$/.test(s);
+  for (const n of extractCriFromDigits(text)) out.add(n);
 
-  const fourTwo = candidates.filter(isFourTwo);
-  // If we have any 4/2 candidates, prefer ones with a leading 0 (common for this style).
-  const fourTwoLeading0 = fourTwo.filter((s) => s.startsWith('0'));
-  if (fourTwoLeading0.length) {
-    fourTwoLeading0.sort(); // deterministic
-    return fourTwoLeading0[0];
-  }
-  if (fourTwo.length) {
-    fourTwo.sort();
-    return fourTwo[0];
+  for (const m of t.matchAll(/(\d{1,3})\s*\/\s*0?86\b/g)) {
+    const a = parseInt(m[1], 10);
+    if (a >= 1 && a <= CRI_SET_TOTAL) out.add(`${a}/${CRI_SET_TOTAL}`);
   }
 
-  const std = candidates.filter(isStd);
-  if (std.length === 0) return candidates[0];
+  for (const m of t.matchAll(/(\d{1,3})\s*\/\s*(\d{2,3})/g)) {
+    const a = parseInt(m[1], 10);
+    const b = parseInt(m[2], 10);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    if (isCopyrightYear(a) || isCopyrightYear(b)) continue;
+    out.add(`${a}/${b}`);
+  }
 
-  // Prefer right side in typical set sizes (9, 10, 11, 30, 50, 60, 80, 100-300)
-  const goodTotals = new Set([9, 10, 11, 30, 50, 60, 80, 100, 101, 102, 159, 189, 193, 217, 264, 270, 271, 288, 300, 350]);
-  const scored = std
-    .map((s) => {
-      const [a, b] = s.split('/').map((x) => parseInt(x, 10));
-      let score = 0;
-      if (goodTotals.has(b)) score += 5;
-      if (b >= 9 && b <= 400) score += 2;
-      if (a >= 1 && a <= b) score += 2;
-      if (a >= 10 && a <= 999) score += 1;
-      // Penalize tiny fractions like 1/2, 2/10 etc.
-      if (b <= 20) score -= 3;
-      return { s, score };
-    })
-    .sort((x, y) => y.score - x.score);
+  for (const tok of t.split(/\s+/).filter(Boolean)) {
+    const blob = tok.replace(/[^\d]/g, '');
+    if (blob.length < 6 || blob.length > 14) continue;
 
-  return scored[0]?.s || std[0];
+    for (const total3 of THREE_DIGIT_TOTALS) {
+      const b = parseInt(total3, 10);
+      const re = new RegExp(`^(\\d{3})\\d{0,4}${total3}`);
+      const m = blob.match(re);
+      if (m) {
+        const a = parseInt(m[1], 10);
+        if (a >= 1 && a <= b) out.add(`${a}/${b}`);
+      }
+    }
+
+    for (const total of COMMON_SET_TOTALS) {
+      const b = parseInt(total, 10);
+      const re = new RegExp(`^(\\d{2,3})\\d{0,6}${total}`);
+      const m = blob.match(re);
+      if (m) {
+        const a = parseInt(m[1], 10);
+        if (a >= 1 && a <= b) out.add(`${a}/${b}`);
+      }
+    }
+  }
+
+  return [...out].filter(isPlausibleCardNumber);
 }
 
+function pickBestCardNumber(candidates) {
+  const pool = (candidates || []).filter(isPlausibleCardNumber);
+  const cri = pool.filter(isCriCardNumber);
+  if (!cri.length) return '';
+
+  const ranked = [...new Set(cri)]
+    .map((s) => ({ s, score: scoreCardNumber(s) }))
+    .sort((x, y) => y.score - x.score);
+
+  return ranked[0]?.s || '';
+}
+
+function rankCardNumberCandidates(candidates) {
+  const cri = (candidates || []).filter(isCriCardNumber);
+  return [...new Set(cri)]
+    .map((s) => ({ s, score: scoreCardNumber(s) }))
+    .sort((x, y) => y.score - x.score)
+    .map((r) => r.s);
+}
+
+function buildCropRegions(w, h) {
+  if (w <= 0 || h <= 0) return [{ name: 'full' }];
+
+  const mk = (name, leftPct, topPct, widthPct, heightPct) => ({
+    name,
+    left: Math.floor(w * leftPct),
+    top: Math.floor(h * topPct),
+    width: Math.max(160, Math.floor(w * widthPct)),
+    height: Math.max(60, Math.floor(h * heightPct)),
+  });
+
+  // CRI: "0xx/086" sits above the ©2026 copyright line (not on it).
+  return [
+    mk('cri_number', 0.12, 0.805, 0.52, 0.075),
+    mk('cri_number_up', 0.10, 0.785, 0.55, 0.09),
+    mk('cri_footer', 0.04, 0.775, 0.65, 0.11),
+    mk('cri_mid', 0.08, 0.76, 0.70, 0.14),
+    mk('number_bl_tight', 0.0, 0.72, 0.60, 0.18),
+    mk('number_bl_wide', 0.0, 0.68, 0.78, 0.22),
+    { name: 'full' },
+  ];
+}
+
+async function preprocessRegion(inputBuf, region, variant) {
+  let img = sharp(inputBuf).rotate();
+  if (region.name !== 'full') {
+    const meta = await sharp(inputBuf).rotate().metadata();
+    const maxTop = Math.max(0, (meta.height || 0) - region.height);
+    const maxLeft = Math.max(0, (meta.width || 0) - region.width);
+    const top = Math.min(region.top, maxTop);
+    const left = Math.min(region.left, maxLeft);
+    const height = Math.min(region.height, (meta.height || region.height) - top);
+    const width = Math.min(region.width, (meta.width || region.width) - left);
+    if (width < 40 || height < 20) return null;
+    img = img.extract({ left, top, width, height });
+  }
+
+  const meta = await img.metadata();
+  const targetW = Math.max(1400, Math.min(2600, (meta.width || 1200) * 2.5));
+  img = img.resize({ width: targetW, withoutEnlargement: false });
+
+  if (variant === 'soft') {
+    return img.grayscale().normalise().sharpen().png().toBuffer();
+  }
+  if (variant === 'contrast') {
+    return img.grayscale().normalise().sharpen({ sigma: 1.4 }).linear(1.8, -40).png().toBuffer();
+  }
+  if (variant === 'threshold') {
+    return img.grayscale().normalise().threshold(145).png().toBuffer();
+  }
+  if (variant === 'threshold_high') {
+    return img.grayscale().normalise().threshold(175).png().toBuffer();
+  }
+  if (variant === 'invert') {
+    return img.grayscale().normalise().negate().linear(1.2, 0).threshold(160).png().toBuffer();
+  }
+  return img.grayscale().normalise().sharpen().linear(1.4, -30).png().toBuffer();
+}
+
+async function recognizeRegion(worker, inputBuf, region, variant, psm) {
+  const pre = await preprocessRegion(inputBuf, region, variant);
+  if (!pre) return '';
+
+  await worker.setParameters({
+    tessedit_char_whitelist: '0123456789/',
+    tessedit_pageseg_mode: psm,
+  });
+  const ret = await worker.recognize(pre);
+  return (ret?.data?.text || '').trim();
+}
+
+const PRIMARY_PASSES = [
+  { region: 'cri_number', variant: 'contrast', psm: '11' },
+  { region: 'cri_number', variant: 'threshold', psm: '11' },
+  { region: 'cri_number_up', variant: 'contrast', psm: '11' },
+  { region: 'cri_footer', variant: 'contrast', psm: '11' },
+  { region: 'cri_mid', variant: 'contrast', psm: '7' },
+  { region: 'number_bl_tight', variant: 'contrast', psm: '11' },
+];
+
+const FALLBACK_PASSES = [
+  { region: 'cri_number_up', variant: 'invert', psm: '11' },
+  { region: 'cri_footer', variant: 'threshold_high', psm: '7' },
+  { region: 'cri_mid', variant: 'soft', psm: '6' },
+  { region: 'number_bl_wide', variant: 'threshold', psm: '11' },
+  { region: 'number_bl_wide', variant: 'invert', psm: '11' },
+];
+
 async function ocrImageBase64(imageBase64, mimeType = 'image/jpeg', opts = {}) {
+  const result = await ocrImageWithVotes(imageBase64, mimeType, opts);
+  return result.text;
+}
+
+async function ocrImageWithVotes(imageBase64, mimeType = 'image/jpeg', opts = {}) {
   const clean = String(imageBase64 || '').replace(/^data:[^;]+;base64,/, '');
   if (!clean) throw new Error('Empty image data');
   const inputBuf = Buffer.from(clean, 'base64');
 
-  const lang = opts.lang || getDefaultOcrLang();
-  const worker = await createWorker(lang);
-  try {
-    await worker.setParameters({
-      tessedit_char_whitelist: opts.whitelist || '0123456789/',
-    });
+  const worker = await getSharedWorker(opts.lang || 'eng');
+  const meta = await sharp(inputBuf).rotate().metadata();
+  const regions = buildCropRegions(meta.width || 0, meta.height || 0);
+  const passes = opts.passes || PRIMARY_PASSES;
+  const votes = new Map();
 
-    // Preprocess: try a few crops where card numbers usually appear (bottom area),
-    // upscale, grayscale, and increase contrast for digits.
-    const meta = await sharp(inputBuf).metadata();
-    const w = meta.width || 0;
-    const h = meta.height || 0;
-    const regions = [];
+  const texts = [];
 
-    if (w > 0 && h > 0) {
-      regions.push({ name: 'bottom_strip', left: 0, top: Math.floor(h * 0.72), width: w, height: Math.floor(h * 0.28) });
-      regions.push({ name: 'bottom_left', left: 0, top: Math.floor(h * 0.72), width: Math.floor(w * 0.65), height: Math.floor(h * 0.28) });
-      regions.push({ name: 'bottom_center', left: Math.floor(w * 0.18), top: Math.floor(h * 0.70), width: Math.floor(w * 0.64), height: Math.floor(h * 0.30) });
-    } else {
-      regions.push({ name: 'full', left: 0, top: 0, width: 0, height: 0 });
-    }
-
-    const texts = [];
-    for (const r of regions) {
+  const runPasses = async (list) => {
+    for (const pass of list) {
+      const region = regions.find((r) => r.name === pass.region) || regions[0];
       // eslint-disable-next-line no-await-in-loop
-      let img = sharp(inputBuf);
-      if (r.name !== 'full') {
-        img = img.extract({ left: r.left, top: r.top, width: r.width, height: r.height });
+      const text = await recognizeRegion(worker, inputBuf, region, pass.variant, pass.psm);
+      if (text) texts.push(text);
+      const nums = extractCardNumbers(text);
+      const fromSlash = /\d{1,3}\s*\/\s*0?86/.test(text);
+      for (const n of nums) {
+        if (!isCriCardNumber(n)) continue;
+        const weight = fromSlash && text.includes(n.split('/')[0]) ? 2 : 1;
+        votes.set(n, (votes.get(n) || 0) + weight);
       }
-      // eslint-disable-next-line no-await-in-loop
-      const pre = await img
-        .resize({ width: Math.min(1400, (r.width || w) * 2), withoutEnlargement: false })
-        .grayscale()
-        .normalise()
-        .threshold(165)
-        .png()
-        .toBuffer();
-
-      // eslint-disable-next-line no-await-in-loop
-      const ret = await worker.recognize(pre);
-      const t = (ret?.data?.text || '').trim();
-      if (t) texts.push(t);
     }
+  };
 
-    return texts.join('\n');
-  } finally {
-    await worker.terminate();
+  await runPasses(passes);
+  if (!votes.size && !opts.passes) {
+    await runPasses(FALLBACK_PASSES);
   }
+
+  return { text: texts.join('\n'), votes };
+}
+
+function pickBestFromVotes(votes) {
+  if (!votes?.size) return { cardNumber: '', rankedCandidates: [] };
+
+  const ranked = [...votes.entries()]
+    .map(([s, count]) => ({
+      s,
+      count,
+      num: parseInt(s.split('/')[0], 10),
+      score: scoreCardNumber(s) + count * 12,
+    }))
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.count - a.count ||
+        b.num - a.num
+    );
+
+  return {
+    cardNumber: ranked[0]?.s || '',
+    rankedCandidates: ranked.map((r) => r.s),
+  };
 }
 
 async function parseCardFromImageOffline(imageBase64, mimeType = 'image/jpeg') {
-  const attempts = [
-    { whitelist: '0123456789/', lang: getDefaultOcrLang() },
-    { whitelist: '0123456789/', lang: 'eng' },
-    // Allow some noise that often appears around the number.
-    { whitelist: '0123456789/.-', lang: 'eng' },
-  ];
+  const { text, votes } = await ocrImageWithVotes(imageBase64, mimeType, { lang: 'eng' });
+  const { cardNumber, rankedCandidates } = pickBestFromVotes(votes);
+  const cardNumbers = rankedCandidates.length
+    ? rankedCandidates
+    : extractCardNumbers(text).filter(isCriCardNumber);
 
-  const results = [];
-  for (const a of attempts) {
-    // eslint-disable-next-line no-await-in-loop
-    const text = await ocrImageBase64(imageBase64, mimeType, a);
-    const cardNumbers = extractCardNumbers(text);
-    results.push({ text, cardNumbers, cardNumber: pickBestCardNumber(cardNumbers), attempt: a });
-    if (cardNumbers.length) break;
-  }
-
-  const best = results.find((r) => r.cardNumbers.length) || results[0] || { text: '', cardNumbers: [], cardNumber: '' };
   return {
-    text: best.text,
-    cardNumbers: best.cardNumbers,
-    cardNumber: best.cardNumber,
-    confidence: best.cardNumbers.length ? 'medium' : 'low',
-    debugAttempts: results.map((r) => ({ cardNumbers: r.cardNumbers, cardNumber: r.cardNumber })),
+    text,
+    cardNumbers,
+    cardNumber,
+    rankedCandidates,
+    confidence: isCriCardNumber(cardNumber) ? 'high' : cardNumber ? 'medium' : 'low',
+    setHint: 'CRI',
+    debugAttempts: [{ cardNumbers, cardNumber, votes: Object.fromEntries(votes) }],
   };
 }
 
 module.exports = {
   extractCardNumbers,
+  extractCriFromDigits,
   pickBestCardNumber,
+  rankCardNumberCandidates,
+  isPlausibleCardNumber,
+  isCriCardNumber,
   ocrImageBase64,
+  ocrImageWithVotes,
   parseCardFromImageOffline,
   preloadOcr,
   getDefaultOcrLang,
+  terminateSharedWorker,
+  CRI_SET_TOTAL,
 };
-

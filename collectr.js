@@ -17,6 +17,94 @@ const HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
+async function searchCardsViaBrowser(query) {
+  // Collectr now renders client-side for some requests. Use Playwright to execute JS
+  // and capture the JSON response that contains product_id / card_number fields.
+  let chromium;
+  try {
+    ({ chromium } = require('playwright'));
+  } catch (e) {
+    throw new Error(
+      'Collectr search requires Playwright. Run: npm install playwright && npx playwright install chromium'
+    );
+  }
+
+  const url = `${COLLECTR_BASE}/?query=${encodeURIComponent(query)}`;
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  let products = null;
+  const isProductPayload = (obj) => {
+    if (!obj) return false;
+    // Common shapes: { data: [...] } or { data: { data: [...] } }
+    const arr =
+      (Array.isArray(obj.data) && obj.data) ||
+      (obj.data && Array.isArray(obj.data.data) && obj.data.data) ||
+      null;
+    if (!arr || arr.length === 0) return false;
+    const first = arr[0];
+    return first && (first.product_id || first.card_number || first.product_name);
+  };
+
+  page.on('response', async (res) => {
+    if (products) return;
+    const u = res.url();
+    // Limit parsing to likely data endpoints; still handle mislabeled content-types.
+    if (!/(api|graphql|search|products|catalog)/i.test(u)) return;
+    try {
+      const json = await res.json();
+      if (isProductPayload(json)) {
+        products =
+          (Array.isArray(json.data) && json.data) ||
+          (json.data && Array.isArray(json.data.data) && json.data.data) ||
+          null;
+      }
+    } catch {
+      try {
+        const body = await res.text();
+        if (!body || !body.includes('product_id')) return;
+        // Try to locate a JSON array after "data":
+        const idx = body.indexOf('"data":');
+        if (idx === -1) return;
+        const start = idx + '"data":'.length;
+        // bracket match for array
+        let depth = 0;
+        let i = start;
+        while (i < body.length) {
+          if (body[i] === '[') depth++;
+          if (body[i] === ']') {
+            depth--;
+            if (depth === 0) {
+              i++;
+              break;
+            }
+          }
+          i++;
+        }
+        if (depth !== 0) return;
+        const raw = body.substring(start, i);
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length && (arr[0].product_id || arr[0].card_number)) {
+          products = arr;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+  // give XHR a moment after networkidle
+  await page.waitForTimeout(1500);
+  await browser.close();
+
+  if (!products) {
+    return [];
+  }
+  console.log(`[Collectr] Found ${products.length} products (browser)`); // keep same log style
+  return products.map(normalizeProduct);
+}
+
 /**
  * Search for cards on Collectr by name.
  */
@@ -25,7 +113,30 @@ async function searchCards(query) {
   console.log(`[Collectr] Fetching: ${url}`);
 
   const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
-  return extractCardsFromHtml(res.data);
+  const cards = extractCardsFromHtml(res.data);
+  if (cards.length) return cards;
+  // CSR fallback
+  const viaBrowser = await searchCardsViaBrowser(query);
+  if (viaBrowser.length) return viaBrowser;
+
+  // Collectr often expects leading zeros for set-style numbers (e.g. 043/086).
+  const m = String(query || '').trim().match(/^(\d{1,3})\s*\/\s*(\d{2,3})$/);
+  if (m) {
+    const left = m[1].padStart(3, '0');
+    const right = m[2].padStart(3, '0');
+    const padded = `${left}/${right}`;
+    if (padded !== query) {
+      const paddedUrl = `${COLLECTR_BASE}/?query=${encodeURIComponent(padded)}`;
+      console.log(`[Collectr] Retrying with zeros: ${paddedUrl}`);
+      const res2 = await axios.get(paddedUrl, { headers: HEADERS, timeout: 15000 });
+      const cards2 = extractCardsFromHtml(res2.data);
+      if (cards2.length) return cards2;
+      const viaBrowser2 = await searchCardsViaBrowser(padded);
+      if (viaBrowser2.length) return viaBrowser2;
+    }
+  }
+
+  return [];
 }
 
 /**
@@ -141,34 +252,48 @@ async function getCardDetails(collectrUrl, hintTitle) {
  */
 function extractCardsFromHtml(html) {
   try {
-    const MARKER = '\\"data\\":[{\\"product_id\\"';
-    const markerIdx = html.indexOf(MARKER);
+    // Collectr moved to Next.js App Router + React Flight streaming.
+    // Product JSON is embedded inside self.__next_f.push([1,"..."]) payload strings.
+    const payloads = [];
+    const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
+    let m;
+    while ((m = re.exec(html))) {
+      payloads.push(m[1]);
+    }
 
+    if (!payloads.length) {
+      console.warn('[Collectr] Next.js flight payload not found in HTML');
+      return [];
+    }
+
+    const flight = payloads
+      .join('')
+      .replace(/\\n/g, '\n')
+      .replace(/\\"/g, '"')
+      .replace(/\\u0026/g, '&')
+      .replace(/\\u003c/g, '<')
+      .replace(/\\u003e/g, '>')
+      .replace(/\\\\/g, '\\');
+
+    const MARKER = '"data":[{"product_id"';
+    const markerIdx = flight.indexOf(MARKER);
     if (markerIdx === -1) {
       console.warn('[Collectr] Product data marker not found in HTML');
       return [];
     }
 
-    const arrayStart = markerIdx + '\\"data\\":'.length;
+    const arrayStart = markerIdx + '"data":'.length;
 
     let depth = 0;
     let inString = false;
     let i = arrayStart;
 
-    while (i < html.length) {
-      if (html[i] === '\\' && html[i + 1] === '"') {
-        inString = !inString;
-        i += 2;
-        continue;
-      }
-      if (html[i] === '\\' && html[i + 1] === '\\') {
-        i += 2;
-        continue;
-      }
-
+    while (i < flight.length) {
+      const ch = flight[i];
+      if (ch === '"' && flight[i - 1] !== '\\') inString = !inString;
       if (!inString) {
-        if (html[i] === '[') depth++;
-        if (html[i] === ']') {
+        if (ch === '[') depth++;
+        if (ch === ']') {
           depth--;
           if (depth === 0) {
             i++;
@@ -179,15 +304,8 @@ function extractCardsFromHtml(html) {
       i++;
     }
 
-    const rawEscaped = html.substring(arrayStart, i);
-
-    const unescaped = rawEscaped
-      .replace(/\\"/g, '"')
-      .replace(/\\u0026/g, '&')
-      .replace(/\\u003c/g, '<')
-      .replace(/\\u003e/g, '>');
-
-    const products = JSON.parse(unescaped);
+    const raw = flight.substring(arrayStart, i);
+    const products = JSON.parse(raw);
 
     if (!Array.isArray(products) || products.length === 0) {
       console.warn('[Collectr] Parsed empty product array');

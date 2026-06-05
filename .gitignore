@@ -2,3 +2,4 @@ node_modules/
 .oauth_state
 .env
 config.json
+docs

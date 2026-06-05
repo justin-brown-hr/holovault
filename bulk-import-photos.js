@@ -9,7 +9,7 @@ const {
   searchCollectrFromParsed,
   pickCardForBulkImport,
 } = require('./card-vision');
-const { parseCardFromImageOffline } = require('./local-ocr');
+const { parseCardFromImageOffline, rankCardNumberCandidates } = require('./local-ocr');
 const { searchCards } = require('./collectr');
 const {
   addOrUpdateProduct,
@@ -26,18 +26,40 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function resolveOcrWithCollectr(offline) {
+  const candidates = rankCardNumberCandidates([
+    ...(offline.rankedCandidates || []),
+    ...(offline.cardNumbers || []),
+    ...(offline.cardNumber ? [offline.cardNumber] : []),
+  ]);
+
+  for (const cardNumber of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const cards = await searchCards(cardNumber);
+    if (cards?.length) {
+      console.log(`[OCR] Collectr matched #${cardNumber} (${cards.length} results)`);
+      return { cardNumber, cards, candidates };
+    }
+  }
+
+  return { cardNumber: '', cards: [], candidates };
+}
+
 async function parsePhoto(base64, mimeType, useOpenAi) {
   if (useOpenAi) {
     return parseCardImage(base64, mimeType);
   }
   const offline = await parseCardFromImageOffline(base64, mimeType);
+  const resolved = await resolveOcrWithCollectr(offline);
   return {
     name: '',
-    cardNumber: offline.cardNumber || '',
+    cardNumber: resolved.cardNumber,
     setName: '',
     subType: '',
     language: 'other',
-    confidence: offline.confidence,
+    confidence: resolved.cardNumber ? offline.confidence : 'low',
+    ocrCandidates: resolved.candidates,
+    collectrCards: resolved.cards,
   };
 }
 
@@ -45,6 +67,9 @@ async function findOnCollectr(parsed, useOpenAi) {
   if (useOpenAi) {
     const r = await searchCollectrFromParsed(parsed);
     return { cards: r.cards, searchMethod: r.searchMethod };
+  }
+  if (parsed.collectrCards?.length) {
+    return { cards: parsed.collectrCards, searchMethod: 'card_number' };
   }
   if (!parsed.cardNumber) {
     return { cards: [], searchMethod: null };

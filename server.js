@@ -33,7 +33,7 @@ const {
   finishBulkSession,
   getMaxPhotos,
 } = require('./bulk-import-photos');
-const { parseCardFromImageOffline, preloadOcr } = require('./local-ocr');
+const { parseCardFromImageOffline, preloadOcr, rankCardNumberCandidates } = require('./local-ocr');
 
 function getConfig() {
   return {
@@ -129,20 +129,34 @@ app.post('/api/search-image', async (req, res) => {
       res.json({ cards, parsed, searchMethod, queriesTried, mode: 'openai' });
     } else {
       const offline = await parseCardFromImageOffline(clean, mimeType || 'image/jpeg');
-      const cardNumber = offline.cardNumber;
+      const candidates = rankCardNumberCandidates([
+        ...(offline.rankedCandidates || []),
+        ...(offline.cardNumbers || []),
+        ...(offline.cardNumber ? [offline.cardNumber] : []),
+      ]);
+      let cardNumber = '';
+      let cards = [];
+      for (const candidate of candidates) {
+        // eslint-disable-next-line no-await-in-loop
+        const results = await searchCards(candidate);
+        if (results?.length) {
+          cardNumber = candidate;
+          cards = results;
+          break;
+        }
+      }
       if (!cardNumber) {
         return res.status(422).json({
           error: 'Could not read card number from photo (offline OCR). Try a clearer photo.',
-          parsed: offline,
+          parsed: { ...offline, ocrCandidates: candidates },
           mode: 'ocr',
         });
       }
-      const cards = await searchCards(cardNumber);
       res.json({
         cards,
         parsed: { name: '', cardNumber, setName: '', subType: '', language: 'other', confidence: offline.confidence },
         searchMethod: 'card_number',
-        queriesTried: [cardNumber],
+        queriesTried: candidates.slice(0, 5),
         mode: 'ocr',
       });
     }
